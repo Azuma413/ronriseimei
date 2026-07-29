@@ -42,8 +42,7 @@ def dynamics(params: CartPoleParams, state: jnp.ndarray, force) -> jnp.ndarray:
 def reset(task: TaskConfig, key: jax.Array) -> jnp.ndarray:
     return jnp.array(task.initial_state) + jax.random.uniform(key, (4,), minval=-0.05, maxval=0.05)
 
-def step(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, action) -> tuple:
-    force = jnp.where(action == 1, params.force_mag, -params.force_mag)
+def transition(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, force):
     next_state = dynamics(params, state, force)
     if task.wrap_angle:  # 角度を[-pi, pi)へ折り返す
         next_state = next_state.at[2].set(jnp.mod(next_state[2] + jnp.pi, 2.0 * jnp.pi) - jnp.pi)
@@ -63,3 +62,8 @@ def step(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, action) -
     else:
         reward = 1.0
     return next_state, reward, done
+
+def step(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, action) -> tuple:
+    """離散行動を力へ変換して課題を1ステップ進める."""
+    force = jnp.where(action == 1, params.force_mag, -params.force_mag)
+    return transition(params, task, state, force)
