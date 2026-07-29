@@ -18,11 +18,16 @@ class TaskConfig(NamedTuple):
     """初期状態・報酬・終端条件をまとめた課題設定 (jitの静的引数として渡す)."""
     initial_state: tuple = (0.0, 0.0, 0.0, 0.0)
     wrap_angle: bool = False
-    terminate_on_limits: bool = True
-    uprightness_reward: bool = False
+    terminate_on_limits: bool = True   # |x|>x_limit または |theta|>theta_limit で終端
+    terminate_on_rail: bool = False    # レール端 |x|>x_limit のみで終端
+    uprightness_reward: bool = False   # r = (1+cos(theta))/2  (非負)
+    cosine_reward: bool = False        # r = cos(theta)  (負値を含む. 報酬設計の失敗例)
 
 STABILIZATION_TASK = TaskConfig()
 SWINGUP_TASK = TaskConfig(initial_state=(0.0, 0.0, jnp.pi, 0.0), wrap_angle=True, terminate_on_limits=False, uprightness_reward=True)
+# 予備実験用: 報酬を負値を含む cos(theta) とし, レール端で終端する素朴な設計.
+# 毎ステップ負の報酬を受けるため, 早期に終端することが収益最大化になってしまう.
+SWINGUP_NAIVE_TASK = TaskConfig(initial_state=(0.0, 0.0, jnp.pi, 0.0), wrap_angle=True, terminate_on_limits=False, terminate_on_rail=True, cosine_reward=True)
 
 def dynamics(params: CartPoleParams, state: jnp.ndarray, force) -> jnp.ndarray:
     """運動方程式に基づき1ステップ後の状態を返す純粋関数
@@ -51,8 +56,19 @@ def transition(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, for
         next_state = next_state.at[2].set(
             jnp.mod(next_state[2] + jnp.pi, 2.0 * jnp.pi) - jnp.pi)
     x, theta = next_state[0], next_state[2]
-    done = ((jnp.abs(x) > params.x_limit) | (jnp.abs(theta) > params.theta_limit) if task.terminate_on_limits else jnp.bool_(False))
-    reward = (1.0 + jnp.cos(theta)) / 2.0 if task.uprightness_reward else 1.0
+    if task.terminate_on_limits:
+        done = (jnp.abs(x) > params.x_limit) | (jnp.abs(theta) > params.theta_limit)
+    elif task.terminate_on_rail:
+        done = jnp.abs(x) > params.x_limit
+    else:
+        done = jnp.bool_(False)
+
+    if task.cosine_reward:
+        reward = jnp.cos(theta)
+    elif task.uprightness_reward:
+        reward = (1.0 + jnp.cos(theta)) / 2.0
+    else:
+        reward = 1.0
     return next_state, reward, done
 
 def step(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, action) -> tuple:

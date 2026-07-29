@@ -133,13 +133,13 @@ def train_vec(params: env.CartPoleParams, task: env.TaskConfig, config: AgentCon
         finished = dones | timeout
         fresh = jax.vmap(env.reset, in_axes=(None, 0))(task, jax.random.split(key_reset, num_envs))
         states = jnp.where(finished[:, None], fresh, next_states)
-        out = (finished, ep_return)
+        out = (finished, ep_return, ep_steps + 1)  # 終端した時点の ep_steps+1 がエピソード長
         ep_return = jnp.where(finished, 0.0, ep_return)
         ep_steps = jnp.where(finished, 0, ep_steps + 1)
         return (q_table, states, buffer, ep_return, ep_steps, key), out
 
-    carry, (finished, returns) = jax.lax.scan(scan_step, init_carry, jnp.arange(iterations))
-    return carry[0], finished, returns
+    carry, (finished, returns, lengths) = jax.lax.scan(scan_step, init_carry, jnp.arange(iterations))
+    return carry[0], finished, returns, lengths
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 5))
 def rollout_greedy(params: env.CartPoleParams, task: env.TaskConfig, config: AgentConfig, q_table, x0, steps=500):
