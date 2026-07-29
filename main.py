@@ -48,7 +48,8 @@ EXPERIMENTS = (
         num_envs=64,
         evaluation_state=(0.5, 0.0, 10.0 * jnp.pi / 180.0, 0.0),
         comparison_filename="dyna_curve.png",
-        trajectory_filename=None),
+        trajectory_filename=None
+    ),
     ExperimentConfig(
         name="swingup",
         task=env.SWINGUP_TASK,
@@ -63,7 +64,8 @@ EXPERIMENTS = (
         num_envs=64,
         evaluation_state=(0.0, 0.0, jnp.pi - 0.05, 0.0),
         comparison_filename="swingup_dyna_curve.png",
-        trajectory_filename="swingup_traj.png"),
+        trajectory_filename="swingup_traj.png"
+    ),
 )
 
 ALGORITHMS = (
@@ -88,32 +90,28 @@ def lqr_gain(params):
     return agent.solve_dare(A, B, Q, R)
 
 def train_trials(params, experiment, training):
-    """全seedをvmapで同時に学習する. 各seedはnum_envs個の環境を並列に進める."""
+    """全seedをvmapで同時に学習"""
     keys = jax.random.split(jax.random.PRNGKey(0), experiment.num_seeds)
     q_tables, finished, returns, lengths = jax.jit(jax.vmap(
         lambda key: agent.train_vec(
             params, experiment.task, experiment.agent_config, training,
             experiment.num_envs, key)))(keys)
     finished, returns, lengths = np.array(finished), np.array(returns), np.array(lengths)
-
-    # イテレーションiの時点で消費した環境ステップ数は i * num_envs
     iterations = finished.shape[1]
-    index = np.broadcast_to(
-        (np.arange(iterations) * experiment.num_envs)[:, None], finished.shape[1:])
-
+    index = np.broadcast_to((np.arange(iterations) * experiment.num_envs)[:, None], finished.shape[1:])
     trials = []
     for seed in range(experiment.num_seeds):
         mask = finished[seed].ravel()
         steps = index.ravel()[mask]
-        order = np.argsort(steps, kind="stable")  # 並列環境をまたいで時系列順に並べ直す
+        order = np.argsort(steps, kind="stable")
         trials.append(TrialResult(
             q_table=q_tables[seed], steps=steps[order],
             returns=returns[seed].ravel()[mask][order],
-            lengths=lengths[seed].ravel()[mask][order]))
+            lengths=lengths[seed].ravel()[mask][order]
+        ))
     return tuple(trials)
 
 def trial_curves(trials, field="returns"):
-    """各trialの移動平均カーブ (steps, values) を返す. 短すぎるものは捨てる."""
     curves = []
     for trial in trials:
         average = moving_average(getattr(trial, field))
@@ -122,7 +120,6 @@ def trial_curves(trials, field="returns"):
     return curves
 
 def aggregate_curves(curves, points=500):
-    """seedごとに刻みが違うカーブを共通グリッドへ内挿し, 平均と分位点を返す."""
     start = max(steps[0] for steps, _ in curves)
     stop = min(steps[-1] for steps, _ in curves)
     grid = np.linspace(start, stop, points)
@@ -131,7 +128,7 @@ def aggregate_curves(curves, points=500):
     return grid, stacked.mean(axis=0), lower, upper, low10, high90
 
 def execute(params, experiment, algorithm):
-    """1つの課題設定と1つの手法の組を学習・評価する."""
+    """1つの課題設定と1つの手法の組を学習・評価"""
     x0 = jnp.array(experiment.evaluation_state)
     if algorithm.planning_steps is None:
         states, forces, rewards, dones = agent.simulate_lqr(
@@ -148,14 +145,13 @@ def execute(params, experiment, algorithm):
             trials[0].q_table, x0,
             steps=training.max_episode_steps)
         forces = None
-
     result = ExperimentResult(
         trials=trials,
         states=np.array(states),
         rewards=np.array(rewards),
         dones=np.array(dones),
-        forces=None if forces is None else np.array(forces))
-
+        forces=None if forces is None else np.array(forces)
+    )
     label = f"{experiment.name}/{algorithm.name}"
     if experiment.task.terminate_on_limits:
         failures = np.flatnonzero(result.dones)
@@ -163,14 +159,6 @@ def execute(params, experiment, algorithm):
         print(f"[{label}] survived: {survived} steps")
     else:
         print(f"[{label}] return: {result.rewards.sum():.1f}")
-
-    if trials:
-        final_averages = [values[-1] for _, values in trial_curves(trials)]
-        print(
-            f"[{label}] final return (MA): "
-            f"{np.mean(final_averages):.1f} +/- {np.std(final_averages):.1f} "
-            f"({len(final_averages)} seeds)"
-        )
     return result
 
 def plot_lqr_reference(results):
@@ -178,8 +166,7 @@ def plot_lqr_reference(results):
     if "lqr" not in results:
         return
     value = results["lqr"].rewards.sum()
-    plt.axhline(value, color="tab:red", ls="--", lw=1.5,
-                label=f"LQR (return {value:.0f})")
+    plt.axhline(value, color="tab:red", ls="--", lw=1.5, label=f"LQR (return {value:.0f})")
 
 def plot_learning_comparison(experiment, results):
     plt.figure(figsize=(8, 5))
@@ -191,77 +178,49 @@ def plot_learning_comparison(experiment, results):
         curves = trial_curves(results[name].trials)
         grid, mean_curve, lower, upper, _, _ = aggregate_curves(curves)
         plt.fill_between(grid, lower, upper, color=color, alpha=0.25, lw=0)
-        plt.plot(grid, mean_curve, color=color, lw=2,
-                 label=f"{label} (mean of {len(curves)} seeds, IQR)")
+        plt.plot(grid, mean_curve, color=color, lw=2, label=f"{label} (mean of {len(curves)} seeds, IQR)")
     plot_lqr_reference(results)
-
     plt.xlabel("environment steps")
     plt.ylabel("return (moving average)")
     plt.legend()
     plt.grid(alpha=0.25)
     save_figure(experiment.comparison_filename)
 
-
 def plot_design_ablation(params, experiment, baseline_trials):
-    """swing-up課題における報酬設計と探索の設計の効果を示す.
-
-    左: 素朴な報酬 (cos(theta), レール端で終端) では自滅方策が学習される.
-    右: 報酬を非負化してもQ値のゼロ初期化では学習が進まない."""
     _, axes = plt.subplots(1, 3, figsize=(15, 4.3))
     cap = experiment.training.max_episode_steps
-
-    # 素朴な報酬設計. レール端が終端条件となるためカート位置を状態に含める必要があり,
-    # またオプティミスティック初期化の導入前なので Q_0 = 0 とする.
     naive_config = experiment.agent_config._replace(n_bins=(8, 1, 64, 32), q_init=0.0)
-    naive = experiment._replace(
-        task=env.SWINGUP_NAIVE_TASK, agent_config=naive_config)
+    naive = experiment._replace(task=env.SWINGUP_NAIVE_TASK, agent_config=naive_config)
     naive_trials = train_trials(params, naive, naive.training)
-
-    grid, mean_curve, low, high, _, _ = aggregate_curves(
-        trial_curves(naive_trials, "lengths"))
+    grid, mean_curve, low, high, _, _ = aggregate_curves(trial_curves(naive_trials, "lengths"))
     axes[0].fill_between(grid, low, high, color="tab:red", alpha=0.25, lw=0)
-    axes[0].plot(grid, mean_curve, color="tab:red", lw=2,
-                 label=f"mean of {len(naive_trials)} seeds (IQR)")
+    axes[0].plot(grid, mean_curve, color="tab:red", lw=2, label=f"mean of {len(naive_trials)} seeds (IQR)")
     axes[0].axhline(cap, color="gray", ls=":", lw=1.2, label=f"timeout ({cap} steps)")
     axes[0].set_ylim(0, cap * 1.08)
     axes[0].set_title(r"(a) naive reward $r=\cos\theta$: episode length")
     axes[0].set_ylabel("episode length [steps]")
-    axes[0].annotate(f"{mean_curve[0]:.0f} -> {mean_curve[-1]:.0f} steps",
-                     xy=(grid[-1], mean_curve[-1]), xytext=(0.35, 0.45),
-                     textcoords="axes fraction", color="tab:red",
-                     arrowprops=dict(arrowstyle="->", color="tab:red"))
-
-    # 学習後の貪欲方策の軌道: カートがレール端へ直行して自滅する様子を示す
+    axes[0].annotate(f"{mean_curve[0]:.0f} -> {mean_curve[-1]:.0f} steps", xy=(grid[-1], mean_curve[-1]), xytext=(0.35, 0.45), textcoords="axes fraction", color="tab:red", arrowprops=dict(arrowstyle="->", color="tab:red"))
     x0 = jnp.array(experiment.evaluation_state)
-    rollout = jax.jit(jax.vmap(lambda q: agent.rollout_greedy(
-        params, naive.task, naive_config, q, x0, cap)))
+    rollout = jax.jit(jax.vmap(lambda q: agent.rollout_greedy(params, naive.task, naive_config, q, x0, cap)))
     states, _, dones = rollout(jnp.stack([t.q_table for t in naive_trials]))
     states, dones = np.array(states), np.array(dones)
     for seed in range(len(naive_trials)):
         end = np.argmax(dones[seed]) + 1 if dones[seed].any() else cap
         t = np.arange(end) * params.dt
         axes[1].plot(t, np.abs(states[seed, :end, 0]), color="tab:red", alpha=0.35, lw=1)
-    axes[1].axhline(params.x_limit, color="gray", ls="--", lw=1.2,
-                    label=f"rail limit ({params.x_limit} m)")
+    axes[1].axhline(params.x_limit, color="gray", ls="--", lw=1.2, label=f"rail limit ({params.x_limit} m)")
     axes[1].set_title("(b) naive reward: greedy policy drives to the rail")
     axes[1].set_ylabel("cart position |x| [m]")
     axes[1].set_xlabel("time [s]")
-
-    # 報酬を非負化した上でのQ値初期化の比較
-    zero_init = experiment._replace(
-        agent_config=experiment.agent_config._replace(q_init=0.0))
+    zero_init = experiment._replace(agent_config=experiment.agent_config._replace(q_init=0.0))
     zero_trials = train_trials(params, zero_init, zero_init.training)
-    for trials, color, label in [
-            (zero_trials, "tab:red", r"$Q_0 = 0$"),
-            (baseline_trials, "tab:blue", r"optimistic $Q_0 = 50$")]:
+    for trials, color, label in [(zero_trials, "tab:red", r"$Q_0 = 0$"), (baseline_trials, "tab:blue", r"optimistic $Q_0 = 50$")]:
         grid, mean_curve, low, high, _, _ = aggregate_curves(trial_curves(trials))
         axes[2].fill_between(grid, low, high, color=color, alpha=0.25, lw=0)
-        axes[2].plot(grid, mean_curve, color=color, lw=2,
-                     label=f"{label}: {mean_curve[-1]:.0f}")
+        axes[2].plot(grid, mean_curve, color=color, lw=2, label=f"{label}: {mean_curve[-1]:.0f}")
     axes[2].set_ylim(0, cap * 1.08)
     axes[2].set_title(r"(c) fixed reward $r=(1+\cos\theta)/2$: return")
     axes[2].set_ylabel("return (moving average)")
-
     for ax in (axes[0], axes[2]):
         ax.set_xlabel("environment steps")
     for ax in axes:
@@ -278,9 +237,6 @@ def plot_trajectories(params, experiment, results):
         theta = result.states[:, 2]
         if experiment.task.wrap_angle:
             theta = np.unwrap(theta)
-
-        # 終端後もシミュレーションは続くが, 倒れた後の軌道は方策の挙動ではない
-        # (棒が自由に振れているだけ) ので, 終端した時点で打ち切る.
         failures = np.flatnonzero(result.dones)
         end = failures[0] + 1 if len(failures) else len(theta)
         t = np.arange(end) * params.dt
@@ -292,9 +248,6 @@ def plot_trajectories(params, experiment, results):
         line, = plt.plot(t, degrees, label=label)
         if end < len(theta):
             plt.plot(t[-1], degrees[-1], "x", color=line.get_color(), ms=9, mew=2)
-
-    # 描画範囲を実データに合わせる. swing-upでは角度を巻き戻さずに追うため
-    # 0°と360°がともに倒立, 180°が真下に対応する.
     low = min(d.min() for d in drawn)
     high = max(d.max() for d in drawn)
     margin = 0.08 * max(high - low, 1.0)
@@ -308,11 +261,9 @@ def plot_trajectories(params, experiment, results):
     plt.legend()
     save_figure(experiment.trajectory_filename)
 
-
 if __name__ == "__main__":
     params = env.CartPoleParams()
     results = {}
-
     for experiment in EXPERIMENTS:
         task_results = {}
         for algorithm in ALGORITHMS:
@@ -322,19 +273,12 @@ if __name__ == "__main__":
         plot_learning_comparison(experiment, task_results)
         if experiment.trajectory_filename:
             plot_trajectories(params, experiment, task_results)
-
-    agent.region_of_attraction(
-        params, EXPERIMENTS[0].task, lqr_gain(params))
-
+    agent.region_of_attraction(params, EXPERIMENTS[0].task, lqr_gain(params))
     # swing-up課題の報酬設計・探索設計に関する予備実験
     swingup = EXPERIMENTS[1]
-    naive_trials, zero_trials = plot_design_ablation(
-        params, swingup, results["swingup"]["q-learning"].trials)
+    naive_trials, zero_trials = plot_design_ablation(params, swingup, results["swingup"]["q-learning"].trials)
     naive_len = [values[-1] for _, values in trial_curves(naive_trials, "lengths")]
     naive_ret = [values[-1] for _, values in trial_curves(naive_trials)]
     zero_ret = [values[-1] for _, values in trial_curves(zero_trials)]
-    print(f"[swingup/naive-reward] episode length (MA): "
-          f"{np.mean(naive_len):.1f} +/- {np.std(naive_len):.1f} steps, "
-          f"return {np.mean(naive_ret):.1f}")
-    print(f"[swingup/zero-init]     final return (MA): "
-          f"{np.mean(zero_ret):.1f} +/- {np.std(zero_ret):.1f}")
+    print(f"[swingup/naive-reward] episode length (MA): {np.mean(naive_len):.1f} +/- {np.std(naive_len):.1f} steps, return {np.mean(naive_ret):.1f}")
+    print(f"[swingup/zero-init]     final return (MA): {np.mean(zero_ret):.1f} +/- {np.std(zero_ret):.1f}")
