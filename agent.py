@@ -60,7 +60,9 @@ def select_action(config: AgentConfig, q_table: jnp.ndarray, state: jnp.ndarray,
     return jnp.where(explore, random_a, greedy)
 
 def update(config: AgentConfig, q_table: jnp.ndarray, state: jnp.ndarray, action: jnp.ndarray, reward: jnp.ndarray, next_state: jnp.ndarray, done: jnp.ndarray) -> jnp.ndarray:
-    """Q学習の更新則により新しいQテーブルを返す純粋関数"""
+    """Q学習の更新則により新しいQテーブルを返す純粋関数.
+    1遷移分の基準実装であり, 学習ループでは複数遷移を一括処理する
+    batched_update を用いる (バッチサイズ1のとき両者は厳密に一致する)."""
     s_idx = discretize(config, state)
     ns_idx = discretize(config, next_state)
     target = reward + (1.0 - done) * config.gamma * jnp.max(q_table[ns_idx])
@@ -87,16 +89,22 @@ def batched_update(config: AgentConfig, q_table: jnp.ndarray, states, actions, r
 def train_vec(params: env.CartPoleParams, task: env.TaskConfig, config: AgentConfig, training: TrainingConfig, num_envs: int, key: jax.Array):
     """num_envs個の環境を並列に進め, 1つのQテーブルを共有して学習する.
 
-    総環境ステップ数は train() と揃える (逐次イテレーション数は
+    総環境ステップ数は逐次実行と揃える (逐次イテレーション数は
     total_steps // num_envs に減る). これが壁時計時間を縮める唯一の軸で,
-    代償として価値の逆伝播が num_envs 分の1のホップ数になる."""
+    代償として価値の逆伝播が num_envs 分の1のホップ数になる.
+
+    エピソード経過ステップ数の初期値は環境ごとにずらす. 揃えたままだと,
+    角度による終端がない課題 (swing-up) では全環境が永久に同位相となり,
+    エピソード終了が num_envs * max_episode_steps ごとにしか発生しないため,
+    学習曲線の記録が極端に粗くなる."""
     iterations = training.total_steps // num_envs
     key, key_reset = jax.random.split(key)
+    phase = (jnp.arange(num_envs) * training.max_episode_steps) // num_envs
     init_carry = (
         init_q_table(config),
         jax.vmap(env.reset, in_axes=(None, 0))(task, jax.random.split(key_reset, num_envs)),
         jnp.zeros((training.buffer_size, 4)),
-        jnp.zeros(num_envs), jnp.zeros(num_envs, jnp.int32), key)
+        jnp.zeros(num_envs), phase.astype(jnp.int32), key)
 
     def scan_step(carry, iteration):
         q_table, states, buffer, ep_return, ep_steps, key = carry
@@ -131,43 +139,6 @@ def train_vec(params: env.CartPoleParams, task: env.TaskConfig, config: AgentCon
         return (q_table, states, buffer, ep_return, ep_steps, key), out
 
     carry, (finished, returns) = jax.lax.scan(scan_step, init_carry, jnp.arange(iterations))
-    return carry[0], finished, returns
-
-@partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def train(params: env.CartPoleParams, task: env.TaskConfig, config: AgentConfig, training: TrainingConfig, key: jax.Array):
-    """Q学習を実行する. planning_steps > 0の場合はDyna-Qとなる."""
-    key, key_reset = jax.random.split(key)
-    init_carry = (init_q_table(config), env.reset(task, key_reset), jnp.zeros((training.buffer_size, 4)), jnp.float32(0.0), jnp.int32(0), key)
-
-    def scan_step(carry, step_count):
-        q_table, state, buffer, ep_return, ep_steps, key = carry
-        key, key_act, key_plan, key_reset = jax.random.split(key, 4)
-        action = select_action(config, q_table, state, step_count, key_act)
-        next_state, reward, done = env.step(params, task, state, action)
-        timeout = ep_steps + 1 >= training.max_episode_steps
-        q_table = update(config, q_table, state, action, reward, next_state, done.astype(jnp.float32))
-        if training.planning_steps > 0:
-            buffer = buffer.at[step_count % training.buffer_size].set(state)
-            valid = jnp.minimum(step_count + 1, training.buffer_size)
-
-            def plan_step(q, key_p):
-                k1, k2 = jax.random.split(key_p)
-                s = buffer[jax.random.randint(k1, (), 0, valid)]
-                a = jax.random.randint(k2, (), 0, config.n_actions)
-                s_next, r, d = env.step(params, task, s, a)
-                return update(config, q, s, a, r, s_next, d.astype(jnp.float32)), None
-
-            q_table, _ = jax.lax.scan(plan_step, q_table, jax.random.split(key_plan, training.planning_steps))
-
-        ep_return = ep_return + reward
-        finished = done | timeout
-        state = jnp.where(finished, env.reset(task, key_reset), next_state)
-        out = (finished, ep_return)
-        ep_return = jnp.where(finished, 0.0, ep_return)
-        ep_steps = jnp.where(finished, 0, ep_steps + 1)
-        return (q_table, state, buffer, ep_return, ep_steps, key), out
-
-    carry, (finished, returns) = jax.lax.scan(scan_step, init_carry, jnp.arange(training.total_steps))
     return carry[0], finished, returns
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 5))

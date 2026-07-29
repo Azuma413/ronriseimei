@@ -1,11 +1,4 @@
 """2つの初期化条件と3つの制御手法を総当たりで比較する."""
-import os
-# batched_updateのscatter-addはGPUのatomic加算を用いるため, 既定では重複した
-# (状態, 行動) への加算順序が実行ごとに変わり結果が再現しない. 再現性がseed値
-# のみで定まるようにXLAの決定的モードを有効にする (jaxのimportより前に必要).
-os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "") + " --xla_gpu_deterministic_ops=true").strip()
-
 from pathlib import Path
 from typing import NamedTuple
 import jax
@@ -23,11 +16,10 @@ class ExperimentConfig(NamedTuple):
     agent_config: agent.AgentConfig
     training: agent.TrainingConfig
     num_seeds: int
-    num_envs: int  # 並列環境数. 64まではQ学習・Dyna-Qとも逐次版と有意差なしを確認済み
+    num_envs: int  # 1つのQテーブルを共有して並列に進める環境数
     evaluation_state: tuple
-    curve_filename: str
     comparison_filename: str
-    trajectory_filename: str
+    trajectory_filename: str | None  # Noneなら軌道図を出力しない
 
 class AlgorithmConfig(NamedTuple):
     name: str
@@ -54,9 +46,8 @@ EXPERIMENTS = (
         num_seeds=64,
         num_envs=64,
         evaluation_state=(0.5, 0.0, 10.0 * jnp.pi / 180.0, 0.0),
-        curve_filename="learning_curve.png",
         comparison_filename="dyna_curve.png",
-        trajectory_filename="stabilization_traj.png"),
+        trajectory_filename=None),
     ExperimentConfig(
         name="swingup",
         task=env.SWINGUP_TASK,
@@ -70,7 +61,6 @@ EXPERIMENTS = (
         num_seeds=64,
         num_envs=64,
         evaluation_state=(0.0, 0.0, jnp.pi - 0.05, 0.0),
-        curve_filename="swingup_curve.png",
         comparison_filename="swingup_dyna_curve.png",
         trajectory_filename="swingup_traj.png"),
 )
@@ -129,13 +119,13 @@ def trial_curves(trials):
     return curves
 
 def aggregate_curves(curves, points=500):
-    """seedごとに刻みが違うカーブを共通グリッドへ内挿し, 平均と四分位を返す."""
+    """seedごとに刻みが違うカーブを共通グリッドへ内挿し, 平均と分位点を返す."""
     start = max(steps[0] for steps, _ in curves)
     stop = min(steps[-1] for steps, _ in curves)
     grid = np.linspace(start, stop, points)
     stacked = np.stack([np.interp(grid, steps, values) for steps, values in curves])
-    lower, upper = np.percentile(stacked, [25, 75], axis=0)
-    return grid, stacked.mean(axis=0), lower, upper
+    low10, lower, upper, high90 = np.percentile(stacked, [10, 25, 75, 90], axis=0)
+    return grid, stacked.mean(axis=0), lower, upper, low10, high90
 
 def execute(params, experiment, algorithm):
     """1つの課題設定と1つの手法の組を学習・評価する."""
@@ -180,22 +170,13 @@ def execute(params, experiment, algorithm):
         )
     return result
 
-def plot_seed_learning(result, filename):
-    """seedごとの学習曲線. seed数が多いので個別は薄く, 平均と四分位範囲を重ねる."""
-    curves = trial_curves(result.trials)
-    plt.figure(figsize=(8, 5))
-    for steps, values in curves:
-        plt.plot(steps, values, color="tab:blue", alpha=0.12, lw=0.7)
-    grid, mean_curve, lower, upper = aggregate_curves(curves)
-    plt.fill_between(grid, lower, upper, color="tab:blue", alpha=0.3, lw=0,
-                     label="interquartile range")
-    plt.plot(grid, mean_curve, color="tab:blue", lw=2,
-             label=f"mean of {len(curves)} seeds")
-    plt.xlabel("environment steps")
-    plt.ylabel("return (moving average)")
-    plt.legend()
-    plt.grid(alpha=0.25)
-    save_figure(filename)
+def plot_lqr_reference(results):
+    """LQRの収益を比較用の水平線として引く. LQRは学習を伴わないため定数となる."""
+    if "lqr" not in results:
+        return
+    value = results["lqr"].rewards.sum()
+    plt.axhline(value, color="tab:red", ls="--", lw=1.5,
+                label=f"LQR (return {value:.0f})")
 
 def plot_learning_comparison(experiment, results):
     plt.figure(figsize=(8, 5))
@@ -205,10 +186,11 @@ def plot_learning_comparison(experiment, results):
     }
     for name, (color, label) in styles.items():
         curves = trial_curves(results[name].trials)
-        grid, mean_curve, lower, upper = aggregate_curves(curves)
+        grid, mean_curve, lower, upper, _, _ = aggregate_curves(curves)
         plt.fill_between(grid, lower, upper, color=color, alpha=0.25, lw=0)
         plt.plot(grid, mean_curve, color=color, lw=2,
                  label=f"{label} (mean of {len(curves)} seeds, IQR)")
+    plot_lqr_reference(results)
 
     plt.xlabel("environment steps")
     plt.ylabel("return (moving average)")
@@ -218,39 +200,43 @@ def plot_learning_comparison(experiment, results):
 
 
 def plot_trajectories(params, experiment, results):
-    steps = experiment.training.max_episode_steps
-    t = np.arange(steps) * params.dt
-
     plt.figure(figsize=(8, 4.5))
+    drawn = []
     for algorithm in ALGORITHMS:
-        theta = results[algorithm.name].states[:, 2]
+        result = results[algorithm.name]
+        theta = result.states[:, 2]
         if experiment.task.wrap_angle:
             theta = np.unwrap(theta)
-        plt.plot(t, np.rad2deg(theta), label=algorithm.name)
 
-    plt.axhline(0.0, color="gray", lw=0.8, ls="--")
-    if experiment.task.wrap_angle:
-        plt.axhline(180.0, color="gray", lw=0.5)
-        plt.axhline(-180.0, color="gray", lw=0.5)
+        # 終端後もシミュレーションは続くが, 倒れた後の軌道は方策の挙動ではない
+        # (棒が自由に振れているだけ) ので, 終端した時点で打ち切る.
+        failures = np.flatnonzero(result.dones)
+        end = failures[0] + 1 if len(failures) else len(theta)
+        t = np.arange(end) * params.dt
+        degrees = np.rad2deg(theta[:end])
+        drawn.append(degrees)
+        label = algorithm.name
+        if end < len(theta):
+            label += f" (terminated at {t[-1]:.2f} s)"
+        line, = plt.plot(t, degrees, label=label)
+        if end < len(theta):
+            plt.plot(t[-1], degrees[-1], "x", color=line.get_color(), ms=9, mew=2)
+
+    # 描画範囲を実データに合わせる. swing-upでは角度を巻き戻さずに追うため
+    # 0°と360°がともに倒立, 180°が真下に対応する.
+    low = min(d.min() for d in drawn)
+    high = max(d.max() for d in drawn)
+    margin = 0.08 * max(high - low, 1.0)
+    for level in range(-720, 721, 180):
+        if low - margin <= level <= high + margin:
+            style = dict(lw=0.8, ls="--") if level % 360 == 0 else dict(lw=0.5)
+            plt.axhline(level, color="gray", **style)
+    plt.ylim(low - margin, high + margin)
     plt.xlabel("time [s]")
     plt.ylabel("pole angle [deg]  (0 = upright)")
     plt.legend()
     save_figure(experiment.trajectory_filename)
 
-
-def plot_lqr_diagnostics(params, result):
-    t = np.arange(len(result.states)) * params.dt
-    _, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
-    axes[0].plot(t, result.states[:, 0])
-    axes[0].set_ylabel("cart position x [m]")
-    axes[1].plot(t, np.rad2deg(result.states[:, 2]))
-    axes[1].set_ylabel("pole angle [deg]")
-    axes[2].plot(t, result.forces)
-    axes[2].set_ylabel("control force u [N]")
-    axes[2].set_xlabel("time [s]")
-    for ax in axes:
-        ax.axhline(0.0, color="gray", lw=0.5)
-    save_figure("lqr_result.png")
 
 if __name__ == "__main__":
     params = env.CartPoleParams()
@@ -262,11 +248,9 @@ if __name__ == "__main__":
             print(f"exp {experiment.name}, algo {algorithm.name}")
             task_results[algorithm.name] = execute(params, experiment, algorithm)
         results[experiment.name] = task_results
-        plot_seed_learning(task_results["q-learning"], experiment.curve_filename)
         plot_learning_comparison(experiment, task_results)
-        plot_trajectories(params, experiment, task_results)
+        if experiment.trajectory_filename:
+            plot_trajectories(params, experiment, task_results)
 
-    stabilization = results["stabilization"]
-    plot_lqr_diagnostics(params, stabilization["lqr"])
     agent.region_of_attraction(
         params, EXPERIMENTS[0].task, lqr_gain(params))
