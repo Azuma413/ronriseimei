@@ -94,14 +94,10 @@ def step(params: CartPoleParams, task: TaskConfig,
 def discretize(config: AgentConfig, state: jnp.ndarray) -> jnp.ndarray:
     """連続状態を離散状態インデックスへ変換する純粋関数"""
     low, high = jnp.array(config.state_low), jnp.array(config.state_high)
-    n_bins = jnp.array(config.n_bins)
-    ratio = (state - low) / (high - low)
-    bins = jnp.clip((ratio * n_bins).astype(jnp.int32), 0, n_bins - 1)
-    weights, w = [], 1
-    for n in reversed(config.n_bins):  # 各次元のビン番号を1つの整数に合成
-        weights.append(w)
-        w *= n
-    return jnp.dot(bins, jnp.array(weights[::-1]))
+    bins = ((state - low) / (high - low)
+            * jnp.array(config.n_bins)).astype(jnp.int32)
+    # 4次元のビン番号を1つの整数に合成 (範囲外は端のビンへ丸める)
+    return jnp.ravel_multi_index(tuple(bins), config.n_bins, mode="clip")
 ```
 
 Q学習の更新は式(2)をそのまま実装したものであり, JAXのイミュータブルな配列更新 `q_table.at[...].add(...)` により新しいQテーブルを返す純粋関数として記述した.

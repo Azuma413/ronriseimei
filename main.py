@@ -9,6 +9,7 @@ import agent
 import env
 
 FIG_DIR = Path(__file__).resolve().parent / "fig"
+FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 class ExperimentConfig(NamedTuple):
     name: str
@@ -21,10 +22,6 @@ class ExperimentConfig(NamedTuple):
     comparison_filename: str
     trajectory_filename: str | None  # Noneなら軌道図を出力しない
 
-class AlgorithmConfig(NamedTuple):
-    name: str
-    planning_steps: int | None
-
 class TrialResult(NamedTuple):
     q_table: jax.Array
     steps: np.ndarray     # 各エピソード終了時点までに消費した環境ステップ数
@@ -36,7 +33,6 @@ class ExperimentResult(NamedTuple):
     states: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
-    forces: np.ndarray | None
 
 EXPERIMENTS = (
     ExperimentConfig(
@@ -68,14 +64,9 @@ EXPERIMENTS = (
     ),
 )
 
-ALGORITHMS = (
-    AlgorithmConfig(name="q-learning", planning_steps=0),
-    AlgorithmConfig(name="dyna-q", planning_steps=20),
-    AlgorithmConfig(name="lqr", planning_steps=None),
-)
+ALGORITHMS = {"q-learning": 0, "dyna-q": 20, "lqr": None}  # 手法名 -> プランニング回数 (NoneはLQR)
 
 def save_figure(filename):
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(FIG_DIR / filename, dpi=150)
     plt.close()
@@ -92,88 +83,59 @@ def lqr_gain(params):
 def train_trials(params, experiment, training):
     """全seedをvmapで同時に学習"""
     keys = jax.random.split(jax.random.PRNGKey(0), experiment.num_seeds)
-    q_tables, finished, returns, lengths = jax.jit(jax.vmap(lambda key: agent.train_vec(params, experiment.task, experiment.agent_config, training, experiment.num_envs, key)))(keys)
+    train = lambda key: agent.train_vec(params, experiment.task, experiment.agent_config, training, experiment.num_envs, key)
+    q_tables, finished, returns, lengths = jax.jit(jax.vmap(train))(keys)
     finished, returns, lengths = np.array(finished), np.array(returns), np.array(lengths)
-    iterations = finished.shape[1]
-    index = np.broadcast_to((np.arange(iterations) * experiment.num_envs)[:, None], finished.shape[1:])
+    index = np.broadcast_to((np.arange(finished.shape[1]) * experiment.num_envs)[:, None], finished.shape[1:]).ravel()
     trials = []
     for seed in range(experiment.num_seeds):
         mask = finished[seed].ravel()
-        steps = index.ravel()[mask]
-        order = np.argsort(steps, kind="stable")
-        trials.append(TrialResult(
-            q_table=q_tables[seed], steps=steps[order],
-            returns=returns[seed].ravel()[mask][order],
-            lengths=lengths[seed].ravel()[mask][order]
-        ))
+        order = np.argsort(index[mask], kind="stable")  # 環境ステップ数の順に並べ替える
+        trials.append(TrialResult(q_tables[seed], index[mask][order], returns[seed].ravel()[mask][order], lengths[seed].ravel()[mask][order]))
     return tuple(trials)
 
 def trial_curves(trials, field="returns"):
-    curves = []
-    for trial in trials:
-        average = moving_average(getattr(trial, field))
-        if len(average):
-            curves.append((trial.steps[len(trial.steps) - len(average):], average))
-    return curves
+    """各試行の学習曲線を (環境ステップ数, 移動平均) の組で返す"""
+    averages = [moving_average(getattr(trial, field)) for trial in trials]
+    return [(trial.steps[-len(average):], average) for trial, average in zip(trials, averages)]
 
 def aggregate_curves(curves, points=500):
     start = max(steps[0] for steps, _ in curves)
     stop = min(steps[-1] for steps, _ in curves)
     grid = np.linspace(start, stop, points)
     stacked = np.stack([np.interp(grid, steps, values) for steps, values in curves])
-    low10, lower, upper, high90 = np.percentile(stacked, [10, 25, 75, 90], axis=0)
-    return grid, stacked.mean(axis=0), lower, upper, low10, high90
+    lower, upper = np.percentile(stacked, [25, 75], axis=0)
+    return grid, stacked.mean(axis=0), lower, upper
 
-def execute(params, experiment, algorithm):
+def execute(params, experiment, name, planning_steps):
     """1つの課題設定と1つの手法の組を学習・評価"""
     x0 = jnp.array(experiment.evaluation_state)
-    if algorithm.planning_steps is None:
-        states, forces, rewards, dones = agent.simulate_lqr(
-            params, experiment.task, lqr_gain(params), x0,
-            steps=experiment.training.max_episode_steps,
-            clip_force=not experiment.task.terminate_on_limits
-        )
+    cap = experiment.training.max_episode_steps
+    if planning_steps is None:
         trials = ()
+        rollout = agent.simulate_lqr(params, experiment.task, lqr_gain(params), x0, cap, experiment.task.terminate != "limits")
     else:
-        training = experiment.training._replace(planning_steps=algorithm.planning_steps)
-        trials = train_trials(params, experiment, training)
-        states, rewards, dones = agent.rollout_greedy(params, experiment.task, experiment.agent_config, trials[0].q_table, x0, steps=training.max_episode_steps)
-        forces = None
-    result = ExperimentResult(
-        trials=trials,
-        states=np.array(states),
-        rewards=np.array(rewards),
-        dones=np.array(dones),
-        forces=None if forces is None else np.array(forces)
-    )
-    label = f"{experiment.name}/{algorithm.name}"
-    if experiment.task.terminate_on_limits:
+        trials = train_trials(params, experiment, experiment.training._replace(planning_steps=planning_steps))
+        rollout = agent.rollout_greedy(params, experiment.task, experiment.agent_config, trials[0].q_table, x0, cap)
+    result = ExperimentResult(trials, *(np.array(x) for x in rollout))
+    label = f"{experiment.name}/{name}"
+    if experiment.task.terminate == "limits":
         failures = np.flatnonzero(result.dones)
-        survived = failures[0] + 1 if len(failures) else len(result.dones)
-        print(f"[{label}] survived: {survived} steps")
+        print(f"[{label}] survived: {failures[0] + 1 if len(failures) else len(result.dones)} steps")
     else:
         print(f"[{label}] return: {result.rewards.sum():.1f}")
     return result
 
-def plot_lqr_reference(results):
-    """LQRの収益を比較用の水平線として引く. LQRは学習を伴わないため定数となる."""
-    if "lqr" not in results:
-        return
-    value = results["lqr"].rewards.sum()
-    plt.axhline(value, color="tab:red", ls="--", lw=1.5, label=f"LQR (return {value:.0f})")
-
 def plot_learning_comparison(experiment, results):
     plt.figure(figsize=(8, 5))
-    styles = {
-        "q-learning": ("tab:blue", "Q-learning"),
-        "dyna-q": ("tab:orange", "Dyna-Q"),
-    }
-    for name, (color, label) in styles.items():
+    for name, color, label in [("q-learning", "tab:blue", "Q-learning"), ("dyna-q", "tab:orange", "Dyna-Q")]:
         curves = trial_curves(results[name].trials)
-        grid, mean_curve, lower, upper, _, _ = aggregate_curves(curves)
+        grid, mean_curve, lower, upper = aggregate_curves(curves)
         plt.fill_between(grid, lower, upper, color=color, alpha=0.25, lw=0)
         plt.plot(grid, mean_curve, color=color, lw=2, label=f"{label} (mean of {len(curves)} seeds, IQR)")
-    plot_lqr_reference(results)
+    # LQRは学習を伴わないため, 収益は比較用の水平線となる
+    lqr_return = results["lqr"].rewards.sum()
+    plt.axhline(lqr_return, color="tab:red", ls="--", lw=1.5, label=f"LQR (return {lqr_return:.0f})")
     plt.xlabel("environment steps")
     plt.ylabel("return (moving average)")
     plt.legend()
@@ -181,12 +143,13 @@ def plot_learning_comparison(experiment, results):
     save_figure(experiment.comparison_filename)
 
 def plot_design_ablation(params, experiment, baseline_trials):
+    """報酬設計 (naive) と楽観的初期化の有無を比較する予備実験"""
     _, axes = plt.subplots(1, 3, figsize=(15, 4.3))
     cap = experiment.training.max_episode_steps
     naive_config = experiment.agent_config._replace(n_bins=(8, 1, 64, 32), q_init=0.0)
     naive = experiment._replace(task=env.SWINGUP_NAIVE_TASK, agent_config=naive_config)
     naive_trials = train_trials(params, naive, naive.training)
-    grid, mean_curve, low, high, _, _ = aggregate_curves(trial_curves(naive_trials, "lengths"))
+    grid, mean_curve, low, high = aggregate_curves(trial_curves(naive_trials, "lengths"))
     axes[0].fill_between(grid, low, high, color="tab:red", alpha=0.25, lw=0)
     axes[0].plot(grid, mean_curve, color="tab:red", lw=2, label=f"mean of {len(naive_trials)} seeds (IQR)")
     axes[0].axhline(cap, color="gray", ls=":", lw=1.2, label=f"timeout ({cap} steps)")
@@ -196,12 +159,11 @@ def plot_design_ablation(params, experiment, baseline_trials):
     axes[0].annotate(f"{mean_curve[0]:.0f} -> {mean_curve[-1]:.0f} steps", xy=(grid[-1], mean_curve[-1]), xytext=(0.35, 0.45), textcoords="axes fraction", color="tab:red", arrowprops=dict(arrowstyle="->", color="tab:red"))
     x0 = jnp.array(experiment.evaluation_state)
     rollout = jax.jit(jax.vmap(lambda q: agent.rollout_greedy(params, naive.task, naive_config, q, x0, cap)))
-    states, _, dones = rollout(jnp.stack([t.q_table for t in naive_trials]))
+    states, _, dones = rollout(jnp.stack([trial.q_table for trial in naive_trials]))
     states, dones = np.array(states), np.array(dones)
     for seed in range(len(naive_trials)):
         end = np.argmax(dones[seed]) + 1 if dones[seed].any() else cap
-        t = np.arange(end) * params.dt
-        axes[1].plot(t, np.abs(states[seed, :end, 0]), color="tab:red", alpha=0.35, lw=1)
+        axes[1].plot(np.arange(end) * params.dt, np.abs(states[seed, :end, 0]), color="tab:red", alpha=0.35, lw=1)
     axes[1].axhline(params.x_limit, color="gray", ls="--", lw=1.2, label=f"rail limit ({params.x_limit} m)")
     axes[1].set_title("(b) naive reward: greedy policy drives to the rail")
     axes[1].set_ylabel("cart position |x| [m]")
@@ -209,7 +171,7 @@ def plot_design_ablation(params, experiment, baseline_trials):
     zero_init = experiment._replace(agent_config=experiment.agent_config._replace(q_init=0.0))
     zero_trials = train_trials(params, zero_init, zero_init.training)
     for trials, color, label in [(zero_trials, "tab:red", r"$Q_0 = 0$"), (baseline_trials, "tab:blue", r"optimistic $Q_0 = 50$")]:
-        grid, mean_curve, low, high, _, _ = aggregate_curves(trial_curves(trials))
+        grid, mean_curve, low, high = aggregate_curves(trial_curves(trials))
         axes[2].fill_between(grid, low, high, color=color, alpha=0.25, lw=0)
         axes[2].plot(grid, mean_curve, color=color, lw=2, label=f"{label}: {mean_curve[-1]:.0f}")
     axes[2].set_ylim(0, cap * 1.08)
@@ -226,29 +188,24 @@ def plot_design_ablation(params, experiment, baseline_trials):
 def plot_trajectories(params, experiment, results):
     plt.figure(figsize=(8, 4.5))
     drawn = []
-    for algorithm in ALGORITHMS:
-        result = results[algorithm.name]
-        theta = result.states[:, 2]
-        if experiment.task.wrap_angle:
-            theta = np.unwrap(theta)
+    for name in ALGORITHMS:
+        result = results[name]
+        theta = np.unwrap(result.states[:, 2]) if experiment.task.wrap_angle else result.states[:, 2]
         failures = np.flatnonzero(result.dones)
         end = failures[0] + 1 if len(failures) else len(theta)
         t = np.arange(end) * params.dt
         degrees = np.rad2deg(theta[:end])
         drawn.append(degrees)
-        label = algorithm.name
-        if end < len(theta):
-            label += f" (terminated at {t[-1]:.2f} s)"
-        line, = plt.plot(t, degrees, label=label)
-        if end < len(theta):
+        terminated = end < len(theta)
+        line, = plt.plot(t, degrees, label=name + (f" (terminated at {t[-1]:.2f} s)" if terminated else ""))
+        if terminated:
             plt.plot(t[-1], degrees[-1], "x", color=line.get_color(), ms=9, mew=2)
     low = min(d.min() for d in drawn)
     high = max(d.max() for d in drawn)
     margin = 0.08 * max(high - low, 1.0)
-    for level in range(-720, 721, 180):
+    for level in range(-720, 721, 180):  # 180度ごとの補助線 (0度が直立)
         if low - margin <= level <= high + margin:
-            style = dict(lw=0.8, ls="--") if level % 360 == 0 else dict(lw=0.5)
-            plt.axhline(level, color="gray", **style)
+            plt.axhline(level, color="gray", **(dict(lw=0.8, ls="--") if level % 360 == 0 else dict(lw=0.5)))
     plt.ylim(low - margin, high + margin)
     plt.xlabel("time [s]")
     plt.ylabel("pole angle [deg]  (0 = upright)")
@@ -259,14 +216,10 @@ if __name__ == "__main__":
     params = env.CartPoleParams()
     results = {}
     for experiment in EXPERIMENTS:
-        task_results = {}
-        for algorithm in ALGORITHMS:
-            print(f"exp {experiment.name}, algo {algorithm.name}")
-            task_results[algorithm.name] = execute(params, experiment, algorithm)
-        results[experiment.name] = task_results
-        plot_learning_comparison(experiment, task_results)
+        results[experiment.name] = {name: execute(params, experiment, name, planning) for name, planning in ALGORITHMS.items()}
+        plot_learning_comparison(experiment, results[experiment.name])
         if experiment.trajectory_filename:
-            plot_trajectories(params, experiment, task_results)
+            plot_trajectories(params, experiment, results[experiment.name])
     agent.region_of_attraction(params, EXPERIMENTS[0].task, lqr_gain(params))
     # swing-up課題の報酬設計・探索設計に関する予備実験
     swingup = EXPERIMENTS[1]

@@ -17,14 +17,14 @@ class TaskConfig(NamedTuple):
     """初期状態・報酬・終端条件"""
     initial_state: tuple = (0.0, 0.0, 0.0, 0.0)
     wrap_angle: bool = False
-    terminate_on_limits: bool = True   # |x|>x_limit または |theta|>theta_limit で終端
-    terminate_on_rail: bool = False    # レール端 |x|>x_limit のみで終端
-    uprightness_reward: bool = False   # r = (1+cos(theta))/2  (非負)
-    cosine_reward: bool = False        # r = cos(theta)  (負値を含む. 報酬設計の失敗例)
+    # "limits": |x|>x_limit または |theta|>theta_limit, "rail": レール端のみ, "none": 終端なし
+    terminate: str = "limits"
+    # "survival": r=1, "upright": r=(1+cos(theta))/2, "cosine": r=cos(theta) (報酬設計の失敗例)
+    reward: str = "survival"
 
 STABILIZATION_TASK = TaskConfig()
-SWINGUP_TASK = TaskConfig(initial_state=(0.0, 0.0, jnp.pi, 0.0), wrap_angle=True, terminate_on_limits=False, uprightness_reward=True)
-SWINGUP_NAIVE_TASK = TaskConfig(initial_state=(0.0, 0.0, jnp.pi, 0.0), wrap_angle=True, terminate_on_limits=False, terminate_on_rail=True, cosine_reward=True)
+SWINGUP_TASK = TaskConfig(initial_state=(0.0, 0.0, jnp.pi, 0.0), wrap_angle=True, terminate="none", reward="upright")
+SWINGUP_NAIVE_TASK = TaskConfig(initial_state=(0.0, 0.0, jnp.pi, 0.0), wrap_angle=True, terminate="rail", reward="cosine")
 
 def dynamics(params: CartPoleParams, state: jnp.ndarray, force) -> jnp.ndarray:
     """運動方程式に基づき1ステップ後の状態を返す"""
@@ -47,20 +47,9 @@ def transition(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, for
     if task.wrap_angle:  # 角度を[-pi, pi)へ折り返す
         next_state = next_state.at[2].set(jnp.mod(next_state[2] + jnp.pi, 2.0 * jnp.pi) - jnp.pi)
     x, theta = next_state[0], next_state[2]
-    # done判定
-    if task.terminate_on_limits:
-        done = (jnp.abs(x) > params.x_limit) | (jnp.abs(theta) > params.theta_limit)
-    elif task.terminate_on_rail:
-        done = jnp.abs(x) > params.x_limit
-    else:
-        done = jnp.bool_(False)
-    # 報酬計算
-    if task.cosine_reward:
-        reward = jnp.cos(theta)
-    elif task.uprightness_reward:
-        reward = (1.0 + jnp.cos(theta)) / 2.0
-    else:
-        reward = 1.0
+    off_rail = jnp.abs(x) > params.x_limit
+    done = {"limits": off_rail | (jnp.abs(theta) > params.theta_limit), "rail": off_rail, "none": jnp.bool_(False)}[task.terminate]
+    reward = {"survival": 1.0, "upright": (1.0 + jnp.cos(theta)) / 2.0, "cosine": jnp.cos(theta)}[task.reward]
     return next_state, reward, done
 
 def step(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, action) -> tuple:
