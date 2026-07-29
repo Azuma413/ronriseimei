@@ -92,10 +92,7 @@ def lqr_gain(params):
 def train_trials(params, experiment, training):
     """全seedをvmapで同時に学習"""
     keys = jax.random.split(jax.random.PRNGKey(0), experiment.num_seeds)
-    q_tables, finished, returns, lengths = jax.jit(jax.vmap(
-        lambda key: agent.train_vec(
-            params, experiment.task, experiment.agent_config, training,
-            experiment.num_envs, key)))(keys)
+    q_tables, finished, returns, lengths = jax.jit(jax.vmap(lambda key: agent.train_vec(params, experiment.task, experiment.agent_config, training, experiment.num_envs, key)))(keys)
     finished, returns, lengths = np.array(finished), np.array(returns), np.array(lengths)
     iterations = finished.shape[1]
     index = np.broadcast_to((np.arange(iterations) * experiment.num_envs)[:, None], finished.shape[1:])
@@ -134,16 +131,13 @@ def execute(params, experiment, algorithm):
         states, forces, rewards, dones = agent.simulate_lqr(
             params, experiment.task, lqr_gain(params), x0,
             steps=experiment.training.max_episode_steps,
-            clip_force=not experiment.task.terminate_on_limits)
+            clip_force=not experiment.task.terminate_on_limits
+        )
         trials = ()
     else:
-        training = experiment.training._replace(
-            planning_steps=algorithm.planning_steps)
+        training = experiment.training._replace(planning_steps=algorithm.planning_steps)
         trials = train_trials(params, experiment, training)
-        states, rewards, dones = agent.rollout_greedy(
-            params, experiment.task, experiment.agent_config,
-            trials[0].q_table, x0,
-            steps=training.max_episode_steps)
+        states, rewards, dones = agent.rollout_greedy(params, experiment.task, experiment.agent_config, trials[0].q_table, x0, steps=training.max_episode_steps)
         forces = None
     result = ExperimentResult(
         trials=trials,

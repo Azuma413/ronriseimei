@@ -80,19 +80,16 @@ def train_vec(params: env.CartPoleParams, task: env.TaskConfig, config: AgentCon
         init_q_table(config),
         jax.vmap(env.reset, in_axes=(None, 0))(task, jax.random.split(key_reset, num_envs)),
         jnp.zeros((training.buffer_size, 4)),
-        jnp.zeros(num_envs), phase.astype(jnp.int32), key)
-
+        jnp.zeros(num_envs), phase.astype(jnp.int32), key
+    )
     def scan_step(carry, iteration):
         q_table, states, buffer, ep_return, ep_steps, key = carry
         key, key_act, key_plan, key_reset = jax.random.split(key, 4)
         step_count = iteration * num_envs
-        actions = jax.vmap(select_action, in_axes=(None, None, 0, None, 0))(
-            config, q_table, states, step_count, jax.random.split(key_act, num_envs))
-        next_states, rewards, dones = jax.vmap(env.step, in_axes=(None, None, 0, 0))(
-            params, task, states, actions)
+        actions = jax.vmap(select_action, in_axes=(None, None, 0, None, 0))(config, q_table, states, step_count, jax.random.split(key_act, num_envs))
+        next_states, rewards, dones = jax.vmap(env.step, in_axes=(None, None, 0, 0))(params, task, states, actions)
         timeout = ep_steps + 1 >= training.max_episode_steps
         q_table = batched_update(config, q_table, states, actions, rewards, next_states, dones.astype(jnp.float32))
-
         if training.planning_steps > 0:
             slots = (step_count + jnp.arange(num_envs)) % training.buffer_size
             buffer = buffer.at[slots].set(states)
@@ -101,10 +98,8 @@ def train_vec(params: env.CartPoleParams, task: env.TaskConfig, config: AgentCon
             k1, k2 = jax.random.split(key_plan)
             plan_s = buffer[jax.random.randint(k1, (n_plan,), 0, valid)]
             plan_a = jax.random.randint(k2, (n_plan,), 0, config.n_actions)
-            plan_ns, plan_r, plan_d = jax.vmap(env.step, in_axes=(None, None, 0, 0))(
-                params, task, plan_s, plan_a)
+            plan_ns, plan_r, plan_d = jax.vmap(env.step, in_axes=(None, None, 0, 0))(params, task, plan_s, plan_a)
             q_table = batched_update(config, q_table, plan_s, plan_a, plan_r, plan_ns, plan_d.astype(jnp.float32))
-
         ep_return = ep_return + rewards
         finished = dones | timeout
         fresh = jax.vmap(env.reset, in_axes=(None, 0))(task, jax.random.split(key_reset, num_envs))
@@ -113,7 +108,6 @@ def train_vec(params: env.CartPoleParams, task: env.TaskConfig, config: AgentCon
         ep_return = jnp.where(finished, 0.0, ep_return)
         ep_steps = jnp.where(finished, 0, ep_steps + 1)
         return (q_table, states, buffer, ep_return, ep_steps, key), out
-
     carry, (finished, returns, lengths) = jax.lax.scan(scan_step, init_carry, jnp.arange(iterations))
     return carry[0], finished, returns, lengths
 
@@ -124,7 +118,6 @@ def rollout_greedy(params: env.CartPoleParams, task: env.TaskConfig, config: Age
         action = jnp.argmax(q_table[discretize(config, state)])
         next_state, reward, done = env.step(params, task, state, action)
         return next_state, (state, reward, done)
-
     _, (states, rewards, dones) = jax.lax.scan(body, x0, None, length=steps)
     return states, rewards, dones
 
@@ -156,7 +149,6 @@ def solve_dare(A, B, Q, R, iterations=500):
         K = jnp.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
         P_next = Q + A.T @ P @ (A - B @ K)
         return P_next, None
-
     P, _ = jax.lax.scan(body, Q, None, length=iterations)
     return jnp.linalg.solve(R + B.T @ P @ B, B.T @ P @ A)
 

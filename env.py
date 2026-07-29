@@ -46,8 +46,7 @@ def step(params: CartPoleParams, task: TaskConfig, state: jnp.ndarray, action) -
     force = jnp.where(action == 1, params.force_mag, -params.force_mag)
     next_state = dynamics(params, state, force)
     if task.wrap_angle:  # 角度を[-pi, pi)へ折り返す
-        next_state = next_state.at[2].set(
-            jnp.mod(next_state[2] + jnp.pi, 2.0 * jnp.pi) - jnp.pi)
+        next_state = next_state.at[2].set(jnp.mod(next_state[2] + jnp.pi, 2.0 * jnp.pi) - jnp.pi)
     x, theta = next_state[0], next_state[2]
     # done判定
     if task.terminate_on_limits:
