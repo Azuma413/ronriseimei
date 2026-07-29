@@ -3,6 +3,7 @@ from functools import partial
 from typing import NamedTuple
 import jax
 import jax.numpy as jnp
+import numpy as np
 import env
 
 class AgentConfig(NamedTuple):
@@ -65,6 +66,72 @@ def update(config: AgentConfig, q_table: jnp.ndarray, state: jnp.ndarray, action
     target = reward + (1.0 - done) * config.gamma * jnp.max(q_table[ns_idx])
     td_error = target - q_table[s_idx, action]
     return q_table.at[s_idx, action].add(config.alpha * td_error)
+
+def batched_update(config: AgentConfig, q_table: jnp.ndarray, states, actions, rewards, next_states, dones) -> jnp.ndarray:
+    """複数の遷移を一括でQ学習更新する.
+
+    逐次版と違い, バッチ内の全遷移が更新前のQでブートストラップする.
+    同一(s,a)が重複した場合はTD誤差を平均する (加算にすると実効学習率が
+    重複数倍になり alpha * 重複数 > 1 で発散し得るため).
+    バッチサイズ1のときは update() と厳密に一致する."""
+    s_idx = jax.vmap(discretize, in_axes=(None, 0))(config, states)
+    ns_idx = jax.vmap(discretize, in_axes=(None, 0))(config, next_states)
+    target = rewards + (1.0 - dones) * config.gamma * jnp.max(q_table[ns_idx], axis=-1)
+    td_error = target - q_table[s_idx, actions]
+    flat = s_idx * config.n_actions + actions  # (状態, 行動) を1次元へ
+    total = jnp.zeros(q_table.size).at[flat].add(config.alpha * td_error)
+    count = jnp.zeros(q_table.size).at[flat].add(1.0)
+    return q_table + (total / jnp.maximum(count, 1.0)).reshape(q_table.shape)
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
+def train_vec(params: env.CartPoleParams, task: env.TaskConfig, config: AgentConfig, training: TrainingConfig, num_envs: int, key: jax.Array):
+    """num_envs個の環境を並列に進め, 1つのQテーブルを共有して学習する.
+
+    総環境ステップ数は train() と揃える (逐次イテレーション数は
+    total_steps // num_envs に減る). これが壁時計時間を縮める唯一の軸で,
+    代償として価値の逆伝播が num_envs 分の1のホップ数になる."""
+    iterations = training.total_steps // num_envs
+    key, key_reset = jax.random.split(key)
+    init_carry = (
+        init_q_table(config),
+        jax.vmap(env.reset, in_axes=(None, 0))(task, jax.random.split(key_reset, num_envs)),
+        jnp.zeros((training.buffer_size, 4)),
+        jnp.zeros(num_envs), jnp.zeros(num_envs, jnp.int32), key)
+
+    def scan_step(carry, iteration):
+        q_table, states, buffer, ep_return, ep_steps, key = carry
+        key, key_act, key_plan, key_reset = jax.random.split(key, 4)
+        step_count = iteration * num_envs  # epsilon減衰は環境ステップ基準で揃える
+        actions = jax.vmap(select_action, in_axes=(None, None, 0, None, 0))(
+            config, q_table, states, step_count, jax.random.split(key_act, num_envs))
+        next_states, rewards, dones = jax.vmap(env.step, in_axes=(None, None, 0, 0))(
+            params, task, states, actions)
+        timeout = ep_steps + 1 >= training.max_episode_steps
+        q_table = batched_update(config, q_table, states, actions, rewards, next_states, dones.astype(jnp.float32))
+
+        if training.planning_steps > 0:
+            slots = (step_count + jnp.arange(num_envs)) % training.buffer_size
+            buffer = buffer.at[slots].set(states)
+            valid = jnp.minimum(step_count + num_envs, training.buffer_size)
+            n_plan = training.planning_steps * num_envs  # 環境ステップあたりの計画回数を揃える
+            k1, k2 = jax.random.split(key_plan)
+            plan_s = buffer[jax.random.randint(k1, (n_plan,), 0, valid)]
+            plan_a = jax.random.randint(k2, (n_plan,), 0, config.n_actions)
+            plan_ns, plan_r, plan_d = jax.vmap(env.step, in_axes=(None, None, 0, 0))(
+                params, task, plan_s, plan_a)
+            q_table = batched_update(config, q_table, plan_s, plan_a, plan_r, plan_ns, plan_d.astype(jnp.float32))
+
+        ep_return = ep_return + rewards
+        finished = dones | timeout
+        fresh = jax.vmap(env.reset, in_axes=(None, 0))(task, jax.random.split(key_reset, num_envs))
+        states = jnp.where(finished[:, None], fresh, next_states)
+        out = (finished, ep_return)
+        ep_return = jnp.where(finished, 0.0, ep_return)
+        ep_steps = jnp.where(finished, 0, ep_steps + 1)
+        return (q_table, states, buffer, ep_return, ep_steps, key), out
+
+    carry, (finished, returns) = jax.lax.scan(scan_step, init_carry, jnp.arange(iterations))
+    return carry[0], finished, returns
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
 def train(params: env.CartPoleParams, task: env.TaskConfig, config: AgentConfig, training: TrainingConfig, key: jax.Array):
@@ -161,27 +228,43 @@ def simulate_lqr(params: env.CartPoleParams, task: env.TaskConfig, K, x0, steps=
     return result
 
 
-def region_of_attraction(params: env.CartPoleParams, task: env.TaskConfig, K):
-    """初期角度を振ってLQRの吸引領域を調べる."""
-    def run(theta0_deg, clip):
-        state = jnp.array([0.0, 0.0, jnp.deg2rad(theta0_deg), 0.0])
-        max_x = 0.0
-        for _ in range(1500):
+ROA_ANGLES = (10, 20, 30, 40, 50, 60, 70)  # 吸引領域を調べる初期角度 [deg]
+
+@partial(jax.jit, static_argnums=(0, 1, 4, 5))
+def roa_sweep(params: env.CartPoleParams, task: env.TaskConfig, K, angles_deg, clip=False, steps=1500):
+    """各初期角度からLQRを適用し (収束したか, カートの最大移動量) を返す."""
+    def trial(theta0):
+        def body(carry, _):
+            state, max_x, fallen = carry
             u = (-K @ state)[0]
             if clip:
                 u = jnp.clip(u, -params.force_mag, params.force_mag)
-            state, _, _ = env.transition(params, task, state, u)
-            max_x = max(max_x, abs(float(state[0])))
-            if abs(float(state[2])) > jnp.pi / 2:
-                return False, max_x
-        ok = abs(float(state[2])) < jnp.deg2rad(1) and abs(float(state[0])) < 0.1
-        return ok, max_x
+            next_state, _, _ = env.transition(params, task, state, u)
+            # 一度倒れたら状態も記録も凍結する (逐次版の早期returnと等価)
+            state = jnp.where(fallen, state, next_state)
+            max_x = jnp.where(fallen, max_x, jnp.maximum(max_x, jnp.abs(next_state[0])))
+            fallen = fallen | (jnp.abs(next_state[2]) > jnp.pi / 2)
+            return (state, max_x, fallen), None
+
+        init = (jnp.array([0.0, 0.0, theta0, 0.0]), jnp.float32(0.0), jnp.bool_(False))
+        (final, max_x, fallen), _ = jax.lax.scan(body, init, None, length=steps)
+        converged = (jnp.abs(final[2]) < jnp.deg2rad(1.0)) & (jnp.abs(final[0]) < 0.1)
+        return ~fallen & converged, max_x
+
+    return jax.vmap(trial)(jnp.deg2rad(angles_deg))
+
+def region_of_attraction(params: env.CartPoleParams, task: env.TaskConfig, K, angles=ROA_ANGLES):
+    """初期角度を振ってLQRの吸引領域を調べ, 結果を表示して返す."""
+    angles_deg = jnp.array(angles, dtype=jnp.float32)
+    free_ok, free_x = roa_sweep(params, task, K, angles_deg, clip=False)
+    clip_ok, clip_x = roa_sweep(params, task, K, angles_deg, clip=True)
 
     print("初期角度 | 入力制限なし (max|x|) | ±10N制限 (max|x|)")
-    for th in [10, 20, 30, 40, 50, 60, 70]:
-        ok1, mx1 = run(th, clip=False)
-        ok2, mx2 = run(th, clip=True)
+    for i, th in enumerate(angles):
         print(
-            f"{th:3d} deg | {'成功' if ok1 else '失敗'} ({mx1:4.1f} m)      | "
-            f"{'成功' if ok2 else '失敗'} ({mx2:4.1f} m)"
+            f"{th:3d} deg | {'成功' if free_ok[i] else '失敗'} ({free_x[i]:4.1f} m)      | "
+            f"{'成功' if clip_ok[i] else '失敗'} ({clip_x[i]:4.1f} m)"
         )
+    return {"angles": np.array(angles),
+            "free": (np.array(free_ok), np.array(free_x)),
+            "clipped": (np.array(clip_ok), np.array(clip_x))}

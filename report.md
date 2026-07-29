@@ -42,9 +42,10 @@ $$Q(s_t, a_t) \leftarrow Q(s_t, a_t) + \alpha \left( r_t + (1 - d_t)\, \gamma \m
 
 - **純粋関数化**: 環境・エージェントをクラスの内部状態として持たせるのではなく, 状態 (カートポールの状態ベクトル, Qテーブル, 乱数キー) をすべて関数の引数・返り値として陽に受け渡す純粋関数として実装する.
 - **学習ループ全体のJIT化**: エピソード単位のPythonループを用いず, 学習全体を単一の `jax.lax.scan` として記述する. エピソードの終端処理 (リセット) も `jnp.where` による分岐としてscan内に含めることで, 60万ステップの学習ループ全体が1つの計算グラフとしてコンパイルされる.
+- **環境とseedの並列化**: 表形式Q学習の更新は1ステップあたり数個のスカラー演算しか行わないため, 逐次に実行するとGPUの並列度をまったく利用できない. そこで `jax.vmap` により2つの軸を同時に進める. 第一に, 1つのQテーブルを共有する64個の環境を並列に遷移させる. これにより同じ環境ステップ数に対する逐次イテレーション数が64分の1になる. 第二に, 独立した64個のseedを並列に学習させる. 詳細と妥当性の検証は4.4節で述べる.
 - **明示的な乱数管理**: JAXの乱数は乱数キーを明示的に分割して用いる. これにより実験の再現性がseed値のみで完全に定まる.
 
-この方針により, 60万ステップ × 5試行の学習が数秒で完了する.
+この方針により, 60万ステップ × 64試行の学習が約1.3秒で完了する. 本レポートの全実験 (2課題 × 2手法 × 各64試行の学習, LQRの設計と吸引領域の探索, および全作図) は19秒で終了する.
 
 ## 4 実装
 
@@ -94,40 +95,68 @@ def update(config, q_table, state, action, reward, next_state, done):
 
 ### 4.3 共通学習ループ
 
-`agent.py` の `train` 関数は課題設定と学習設定を引数に取り, 学習ループ全体を `jax.jit` でコンパイルする. 安定化とswing-up, 通常のQ学習とDyna-Qはすべてこの関数を共有する.
+`agent.py` の `train_vec` 関数は課題設定と学習設定を引数に取り, 学習ループ全体を `jax.jit` でコンパイルする. 安定化とswing-up, 通常のQ学習とDyna-Qはすべてこの関数を共有する. scanの1イテレーションで `num_envs` 個の環境がそれぞれ1ステップ進み, 得られた `num_envs` 件の遷移が共有のQテーブルへ反映される.
 
 ```python
-def scan_step(carry, step_count):
-    q_table, state, ep_return, ep_steps, key = carry
+def scan_step(carry, iteration):
+    q_table, states, ep_return, ep_steps, key = carry
     key, key_act, key_reset = jax.random.split(key, 3)
+    step_count = iteration * num_envs  # epsilonの減衰は環境ステップ基準で揃える
 
-    action = agent.select_action(config, q_table, state, step_count, key_act)
-    next_state, reward, done = env.step(params, task, state, action)
-    timeout = ep_steps + 1 >= training.max_episode_steps
-    q_table = agent.update(config, q_table, state, action, reward,
-                           next_state, done.astype(jnp.float32))
+    # num_envs個の環境を同時に進める (Qテーブルは全環境で共有)
+    actions = jax.vmap(select_action, in_axes=(None, None, 0, None, 0))(
+        config, q_table, states, step_count,
+        jax.random.split(key_act, num_envs))
+    next_states, rewards, dones = jax.vmap(
+        env.step, in_axes=(None, None, 0, 0))(params, task, states, actions)
+    q_table = batched_update(config, q_table, states, actions,
+                             rewards, next_states, dones.astype(jnp.float32))
 
-    ep_return = ep_return + reward
-    finished = done | timeout
-    state = jnp.where(
-        finished, env.reset(task, key_reset), next_state)
+    ep_return = ep_return + rewards
+    finished = dones | (ep_steps + 1 >= training.max_episode_steps)
+    fresh = jax.vmap(env.reset, in_axes=(None, 0))(
+        task, jax.random.split(key_reset, num_envs))
+    states = jnp.where(finished[:, None], fresh, next_states)
     out = (finished, ep_return)
     ep_return = jnp.where(finished, 0.0, ep_return)
     ep_steps = jnp.where(finished, 0, ep_steps + 1)
-    return (q_table, state, ep_return, ep_steps, key), out
+    return (q_table, states, ep_return, ep_steps, key), out
 ```
 
-今回は5回の試行を別々のseed値で行い, 学習が特定のseed値に依存していないかを確認した.
+今回は64回の試行を別々のseed値で行い, 学習が特定のseed値に依存していないかを確認した.
+
+### 4.4 環境の並列化とその妥当性
+
+複数の遷移をまとめてQテーブルへ反映する `batched_update` は, 式(2)を単純にベクトル化したものではない. 表形式Q学習では1回の更新が触るのはQテーブルの1セル $Q(s,a)$ のみであり, 深層強化学習のミニバッチのように損失を平均する縮約は起こらない. バッチはあくまで複数セルへの分散書き込みである. ただし逐次実行との差が2点生じる.
+
+第一に, バッチ内のすべての遷移が更新前のQテーブルでブートストラップする. 逐次実行では $Q(s')$ の更新が次のステップの $\max_{a'}Q(s',a')$ に即座に反映され, 軌道に沿って1ステップごとに価値が1ホップ逆流するが, 並列実行では1イテレーションあたり1ホップに留まる. 第二に, バッチ内に同一の $(s,a)$ が複数含まれうる. TD誤差を単純に加算すると実効学習率が重複数倍となり $\alpha \times (\text{重複数}) > 1$ で発散しうるため, 本実装では重複数で割った平均を適用した. バッチサイズ1のとき `batched_update` は式(2)と厳密に一致する.
+
+```python
+def batched_update(config, q_table, states, actions,
+                   rewards, next_states, dones):
+    s_idx = jax.vmap(discretize, in_axes=(None, 0))(config, states)
+    ns_idx = jax.vmap(discretize, in_axes=(None, 0))(config, next_states)
+    target = rewards + (1.0 - dones) * config.gamma * jnp.max(q_table[ns_idx], axis=-1)
+    td_error = target - q_table[s_idx, actions]
+    flat = s_idx * config.n_actions + actions  # (状態, 行動) を1次元へ
+    total = jnp.zeros(q_table.size).at[flat].add(config.alpha * td_error)
+    count = jnp.zeros(q_table.size).at[flat].add(1.0)
+    return q_table + (total / jnp.maximum(count, 1.0)).reshape(q_table.shape)
+```
+
+上記の通り並列化は学習則をわずかに変更するため, 逐次実行と等価な結果が得られるかを実験的に確認した. 総環境ステップ数を揃えた上で並列環境数を1, 16, 64, 256と変え, 各64seedについて学習後の貪欲方策の性能を比較したところ, 安定化課題のQ学習・Dyna-Q, swing-up課題のいずれについても64環境までは逐次実行との間に有意差が認められなかった (Mann-WhitneyのU検定, 有意水準5%). 256環境ではswing-up課題でのみ有意差が生じたが中央値の低下は1.2%であった. 以上より本レポートでは全実験を64環境で実行している. なお同じ比較を5seedで行った際にはDyna-Qが大きく劣化したように見えたが, 64seedでは有意差が消えており, これはseedによるばらつきであった. 並列化によりseed数を確保できたことが, この判断自体を可能にしている.
 
 ## 5 結果
 
-図1に5回の試行における学習曲線を示す. 薄い線は各エピソードの実際の累積報酬を, 濃い線はその移動平均 (窓幅50エピソード) を表す. 横軸は環境におけるステップ回数である. 学習率は $\alpha = 0.1$, 割引率は $\gamma = 0.99$, 総学習ステップ数は60万とした.
+図1に64回の試行における学習曲線を示す. 薄い線は各seedにおける累積報酬の移動平均 (窓幅50エピソード) を, 濃い線は64seedの平均を, 帯は四分位範囲を表す. 横軸は環境におけるステップ回数である. 学習率は $\alpha = 0.1$, 割引率は $\gamma = 0.99$, 総学習ステップ数は60万とした.
 
-![図1: 5回の試行における学習曲線](fig/learning_curve.png)
+![図1: 64回の試行における学習曲線](fig/learning_curve.png)
 
-**図1** 5回の試行における学習曲線
+**図1** 64回の試行における学習曲線 (薄線: 各seed, 濃線: 平均, 帯: 四分位範囲)
 
-この図から, いずれのseed値においても学習初期 (2万ステップ程度まで) は数十ステップで倒れていたポールが, 学習の進行とともに数百ステップ維持できるようになっており, どのseedでも安定化方策が学習できていることが確認できる. 最終的な移動平均は250〜360程度であった. また学習後のQテーブルを用いた貪欲方策で評価したところ, エピソード最大長である500ステップの間ポールを倒さずに維持できることを確認した.
+この図から, いずれのseed値においても学習初期 (2万ステップ程度まで) は数十ステップで倒れていたポールが, 学習の進行とともに数百ステップ維持できるようになっており, どのseedでも安定化方策が学習できていることが確認できる. 最終的な移動平均は64seedの平均で251, 第1〜第9十分位で188〜343であった.
+
+一方で, 学習した方策は必ずしもエピソード最大長を通してポールを維持できるわけではない. 学習後のQテーブルによる貪欲方策を初期状態 $(0,0,0,0)$ から評価すると, 生存ステップ数の中央値は354であり, エピソード最大長である500ステップに到達したのは64seed中19%にとどまった. すなわち移動平均が250前後で頭打ちになるのは学習の未収束ではなく, 獲得された方策自体が一定の確率で失敗することを反映している.
 
 一方で学習後も累積報酬の分散は大きく, エピソードによっては早期に倒れる場合がある. これは状態の離散化により, 同一の離散状態に制御上異なる対応が必要な連続状態が混在すること (状態エイリアシング) が原因と考えられる. 分割数を増やせば解像度は上がるが, 状態数が $K^4$ で増加し各状態の訪問頻度が下がるため学習が遅くなるというトレードオフがある.
 
@@ -139,25 +168,27 @@ def scan_step(carry, step_count):
 
 Dyna-Qでは, 実環境との相互作用による通常のQ学習の更新 (直接RL) に加えて, 実環境の1ステップごとに $n$ 回のプランニングを行う. プランニングでは, 過去に訪問した状態をバッファからランダムにサンプルし, 無作為な行動を選び, 内部モデルにより遷移 $(s, a, r, s')$ を生成して式(2)のQ学習更新を適用する. 実環境との相互作用を増やすことなくQ値の更新回数を $n+1$ 倍にできるため, 環境ステップ数に対するサンプル効率の向上が期待できる.
 
-実装では, 実環境のステップ処理の直後にプランニングのループを `jax.lax.scan` として追加した. 内部モデルとしては環境の `step` 関数をそのまま呼び出している点に注意されたい (エージェントが環境と同一の物理モデルを持つことに対応する). プランニング回数 `planning_steps` は `TrainingConfig` で指定し, `planning_steps = 0` のとき第5節の通常のQ学習と完全に一致する.
+実装では, 実環境のステップ処理の直後にプランニングを追加した. 内部モデルとしては環境の `step` 関数をそのまま呼び出している点に注意されたい (エージェントが環境と同一の物理モデルを持つことに対応する). プランニング回数 `planning_steps` は `TrainingConfig` で指定し, `planning_steps = 0` のとき第5節の通常のQ学習と完全に一致する.
+
+プランニングは $n$ 回の逐次ループとしても書けるが, 本実装では4.4節の `batched_update` により $n \times \mathrm{num\_envs}$ 件の模擬経験を一括で反映する. 逐次ループでは1イテレーションあたり $n+1$ 回のカーネル起動が直列に並ぶため, $n=20$ では1イテレーションの所要時間が約13倍に増大したのに対し, 一括化により約8倍高速化された. 4.4節で述べたブートストラップの遅延と重複の平均化は, このプランニング更新にも同様に適用される.
 
 ```python
 # --- 内部モデルによるプランニング ---
 # 過去に訪問した状態と無作為な行動から, 物理モデルで遷移を生成しQ値を更新する
 if training.planning_steps > 0:
-    valid = jnp.minimum(step_count + 1, training.buffer_size)
+    slots = (step_count + jnp.arange(num_envs)) % training.buffer_size
+    buffer = buffer.at[slots].set(states)
+    valid = jnp.minimum(step_count + num_envs, training.buffer_size)
+    # 環境ステップあたりのプランニング回数を逐次実装と揃える
+    n_plan = training.planning_steps * num_envs
 
-    def plan_step(q, key_p):
-        k1, k2 = jax.random.split(key_p)
-        s = buffer[jax.random.randint(k1, (), 0, valid)]
-        a = jax.random.randint(k2, (), 0, config.n_actions)
-        s_next, r, d = env.step(params, task, s, a)  # モデルによる模擬経験
-        return agent.update(config, q, s, a, r, s_next,
-                            d.astype(jnp.float32)), None
-
-    q_table, _ = jax.lax.scan(
-        plan_step, q_table,
-        jax.random.split(key_plan, training.planning_steps))
+    k1, k2 = jax.random.split(key_plan)
+    plan_s = buffer[jax.random.randint(k1, (n_plan,), 0, valid)]
+    plan_a = jax.random.randint(k2, (n_plan,), 0, config.n_actions)
+    plan_ns, plan_r, plan_d = jax.vmap(  # モデルによる模擬経験
+        env.step, in_axes=(None, None, 0, 0))(params, task, plan_s, plan_a)
+    q_table = batched_update(config, q_table, plan_s, plan_a, plan_r,
+                             plan_ns, plan_d.astype(jnp.float32))
 ```
 
 ### 6.2 結果と考察
