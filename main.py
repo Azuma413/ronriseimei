@@ -1,15 +1,12 @@
 """2つの初期化条件と3つの制御手法を総当たりで比較する."""
 from pathlib import Path
 from typing import NamedTuple
-
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-
 import agent
 import env
-
 
 FIG_DIR = Path(__file__).resolve().parent / "fig"
 
@@ -24,17 +21,14 @@ class ExperimentConfig(NamedTuple):
     comparison_filename: str
     trajectory_filename: str
 
-
 class AlgorithmConfig(NamedTuple):
     name: str
     planning_steps: int | None
-
 
 class TrialResult(NamedTuple):
     q_table: jax.Array
     steps: np.ndarray
     returns: np.ndarray
-
 
 class ExperimentResult(NamedTuple):
     trials: tuple[TrialResult, ...]
@@ -42,7 +36,6 @@ class ExperimentResult(NamedTuple):
     rewards: np.ndarray
     dones: np.ndarray
     forces: np.ndarray | None
-
 
 EXPERIMENTS = (
     ExperimentConfig(
@@ -78,24 +71,20 @@ ALGORITHMS = (
     AlgorithmConfig(name="lqr", planning_steps=None),
 )
 
-
 def save_figure(filename):
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(FIG_DIR / filename, dpi=150)
     plt.close()
 
-
 def moving_average(values, window=50):
     return np.convolve(values, np.ones(window) / window, mode="valid")
-
 
 def lqr_gain(params):
     A, B = agent.linearize(params)
     Q = jnp.diag(jnp.array([1.0, 1.0, 10.0, 1.0]))
     R = jnp.array([[0.1]])
     return agent.solve_dare(A, B, Q, R)
-
 
 def train_trials(params, experiment, training):
     trials = []
@@ -110,11 +99,9 @@ def train_trials(params, experiment, training):
             returns=returns[finished]))
     return tuple(trials)
 
-
 def execute(params, experiment, algorithm):
     """1つの課題設定と1つの手法の組を学習・評価する."""
     x0 = jnp.array(experiment.evaluation_state)
-
     if algorithm.planning_steps is None:
         states, forces, rewards, dones = agent.simulate_lqr(
             params, experiment.task, lqr_gain(params), x0,
@@ -148,10 +135,11 @@ def execute(params, experiment, algorithm):
 
     if trials:
         final_averages = [moving_average(t.returns)[-1] for t in trials]
-        print(f"[{label}] final return (MA): "
-              f"{np.mean(final_averages):.1f}")
+        print(
+            f"[{label}] final return (MA): "
+            f"{np.mean(final_averages):.1f}"
+        )
     return result
-
 
 def plot_seed_learning(result, filename):
     plt.figure(figsize=(8, 5))
@@ -166,7 +154,6 @@ def plot_seed_learning(result, filename):
     plt.ylabel("return (moving average)")
     plt.legend()
     save_figure(filename)
-
 
 def plot_learning_comparison(experiment, results):
     plt.figure(figsize=(8, 5))
@@ -185,9 +172,7 @@ def plot_learning_comparison(experiment, results):
         start = max(steps[0] for steps, _ in series)
         stop = min(steps[-1] for steps, _ in series)
         grid = np.arange(start, stop + 1, 500)
-        mean_curve = np.mean([
-            np.interp(grid, steps, values) for steps, values in series
-        ], axis=0)
+        mean_curve = np.mean([np.interp(grid, steps, values) for steps, values in series], axis=0)
         plt.plot(grid, mean_curve, color=color, lw=2, label=label)
 
     plt.xlabel("environment steps")
@@ -238,12 +223,9 @@ if __name__ == "__main__":
     for experiment in EXPERIMENTS:
         task_results = {}
         for algorithm in ALGORITHMS:
-            task_results[algorithm.name] = execute(
-                params, experiment, algorithm)
+            task_results[algorithm.name] = execute(params, experiment, algorithm)
         results[experiment.name] = task_results
-
-        plot_seed_learning(
-            task_results["q-learning"], experiment.curve_filename)
+        plot_seed_learning(task_results["q-learning"], experiment.curve_filename)
         plot_learning_comparison(experiment, task_results)
         plot_trajectories(params, experiment, task_results)
 
