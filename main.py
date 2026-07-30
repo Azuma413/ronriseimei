@@ -263,15 +263,20 @@ def plot_swingup(pg, analytic, policies, lqr_return):
     # 評価と同じ初期状態分布からサンプルした1点を用いる (分布の平均は角速度0の特異点のため)
     x0 = env.sample_states(SWINGUP_PARAMS, jax.random.PRNGKey(5), 1)[0]
     for name, policy, spec, color in policies:  # 角度は [-180, 180] 度へ折り返して描く
-        states, _, _ = agent.rollout_policy(SWINGUP_PARAMS, spec, jnp.asarray(policy), x0, SWINGUP_STEPS)
-        raw = np.array(states)[:, 2]
-        turns = np.abs(np.unwrap(raw)[-1] - np.unwrap(raw)[150]) / (2.0 * np.pi)
-        print(f"[swingup/trajectory] {name}: rotations over the plotted trajectory {turns:.2f}")
-        angle = np.rad2deg(raw)
-        angle = (angle + 180.0) % 360.0 - 180.0
+        states, _, dones = agent.rollout_policy(SWINGUP_PARAMS, spec, jnp.asarray(policy), x0, SWINGUP_STEPS)
+        states, dones = np.array(states), np.array(dones)
+        end = int(np.argmax(dones)) + 1 if dones.any() else SWINGUP_STEPS   # 終端後は描かない
+        raw = states[:end, 2]
+        turns = np.abs(np.unwrap(raw)[-1] - np.unwrap(raw)[min(150, end - 1)]) / (2.0 * np.pi)
+        print(f"[swingup/trajectory] {name}: {end} steps ({'terminated' if end < SWINGUP_STEPS else 'no termination'}), "
+              f"rotations {turns:.2f}")
+        angle = (np.rad2deg(raw) + 180.0) % 360.0 - 180.0
         jump = np.abs(np.diff(angle)) > 180.0          # 折り返しで縦線が入るのを防ぐ
         angle = np.where(np.append(jump, False), np.nan, angle)
-        axes[1].plot(np.arange(SWINGUP_STEPS) * SWINGUP_PARAMS.dt, angle, color=color, lw=1.2, label=name)
+        t = np.arange(end) * SWINGUP_PARAMS.dt
+        axes[1].plot(t, angle, color=color, lw=1.2, label=name)
+        if end < SWINGUP_STEPS:                        # 終端した位置を明示する
+            axes[1].plot(t[-1], angle[-1], "x", color=color, ms=8, mew=2)
     for level, style in ((0.0, "--"), (180.0, "-"), (-180.0, "-")):
         axes[1].axhline(level, color="gray", lw=0.8, ls=style)
     axes[1].set_ylim(-190, 190)
