@@ -1,6 +1,5 @@
-"""2つの初期化条件と3つの制御手法を総当たりで比較する."""
+"""課題2 カートポールの安定化制御: 方策勾配法, BPTTによる解析的方策勾配, LQRの比較"""
 from pathlib import Path
-from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -11,221 +10,331 @@ import env
 FIG_DIR = Path(__file__).resolve().parent / "fig"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-class ExperimentConfig(NamedTuple):
-    name: str
-    task: env.TaskConfig
-    agent_config: agent.AgentConfig
-    training: agent.TrainingConfig
-    num_seeds: int
-    num_envs: int  # 1つのQテーブルを共有して並列に進める環境数
-    evaluation_state: tuple
-    comparison_filename: str
-    trajectory_filename: str | None  # Noneなら軌道図を出力しない
+SEEDS = 16                     # 試行数 (それぞれ別のseed値)
+PG_STEPS = 960_000_000         # 方策勾配法が消費する実環境ステップ数
+EVAL_STATES, EVAL_STEPS = 256, 600   # 評価: 256個の初期状態から10秒間
+SPEC_PARAMS = env.CartPoleParams()                        # 課題指定どおりの報酬
+SHAPED_PARAMS = env.CartPoleParams(fail_penalty=-20.0)    # 終端ペナルティを加えた報酬
+WRONG_MODEL = env.CartPoleParams(fail_penalty=-20.0, pole_mass=0.5, pole_length=0.75)  # 誤った内部モデル
+CONFIG = agent.AgentConfig(alpha=0.5, clip=3.0)
+BPTT = agent.BpttConfig(alpha=0.1, updates=2000, batch=64, horizon=200)
 
-class TrialResult(NamedTuple):
-    q_table: jax.Array
-    steps: np.ndarray     # 各エピソード終了時点までに消費した環境ステップ数
-    returns: np.ndarray   # そのエピソードの収益
-    lengths: np.ndarray   # そのエピソードの長さ [step]
-
-class ExperimentResult(NamedTuple):
-    trials: tuple[TrialResult, ...]
-    states: np.ndarray
-    rewards: np.ndarray
-    dones: np.ndarray
-
-EXPERIMENTS = (
-    ExperimentConfig(
-        name="stabilization",
-        task=env.STABILIZATION_TASK,
-        agent_config=agent.AgentConfig(),
-        training=agent.TrainingConfig(total_steps=600_000),
-        num_seeds=64,
-        num_envs=64,
-        evaluation_state=(0.5, 0.0, 10.0 * jnp.pi / 180.0, 0.0),
-        comparison_filename="dyna_curve.png",
-        trajectory_filename=None
-    ),
-    ExperimentConfig(
-        name="swingup",
-        task=env.SWINGUP_TASK,
-        agent_config=agent.AgentConfig(
-            n_bins=(1, 1, 64, 32),
-            state_low=(-2.4, -4.0, -jnp.pi, -12.0),
-            state_high=(2.4, 4.0, jnp.pi, 12.0),
-            eps_decay=150000.0,
-            q_init=50.0),
-        training=agent.TrainingConfig(total_steps=3_000_000),
-        num_seeds=64,
-        num_envs=64,
-        evaluation_state=(0.0, 0.0, jnp.pi - 0.05, 0.0),
-        comparison_filename="swingup_dyna_curve.png",
-        trajectory_filename="swingup_traj.png"
-    ),
-)
-
-ALGORITHMS = {"q-learning": 0, "dyna-q": 20, "lqr": None}  # 手法名 -> プランニング回数 (NoneはLQR)
+# --- 5章 swing-up課題 ---
+SWINGUP_PARAMS = env.CartPoleParams(          # 真下から振り上げる. レール端でのみ終端する
+    initial_mean=(0.0, 0.0, float(np.pi), 0.0), terminate_on=(True, False, False, False),
+    upright_reward=True, wrap_angle=True, position_cost=0.5)
+# 方策の形は課題指定どおり mu = theta' phi(s) のまま, 特徴に角度平面のRBFを加える
+SWINGUP_SPEC = agent.PolicySpec(rbf_angle=8, rbf_rate=5, init_scale=1.0)
+SWINGUP_CONFIG = agent.AgentConfig(gamma=0.995, alpha=0.5, clip=3.0)  # 角度基準は課題指定の 3/1000 のまま
+SWINGUP_BPTT = agent.BpttConfig(alpha=0.3, updates=12000, batch=64, horizon=400, clip=1.0)
+SWINGUP_TRAINING = agent.TrainingConfig(total_steps=8_000_000_000, max_episode_steps=500, num_envs=4096)
+SWINGUP_STEPS = 500                           # 評価するエピソード長 (8.33秒)
 
 def save_figure(filename):
     plt.tight_layout()
     plt.savefig(FIG_DIR / filename, dpi=150)
     plt.close()
 
-def moving_average(values, window=50):
-    return np.convolve(values, np.ones(window) / window, mode="valid")
+def moving_ratio(numer, denom, window):
+    """window本の移動平均. 1イテレーションあたりのエピソード数が変わるため比で計算する."""
+    kernel = np.ones(window)
+    return np.convolve(numer, kernel, "valid") / np.maximum(np.convolve(denom, kernel, "valid"), 1.0)
 
-def lqr_gain(params):
-    A, B = agent.linearize(params)
-    Q = jnp.diag(jnp.array([1.0, 1.0, 10.0, 1.0]))
-    R = jnp.array([[0.1]])
-    return agent.solve_dare(A, B, Q, R)
+def train_policy_gradient(params, total_steps=PG_STEPS, config=CONFIG, spec=agent.LINEAR, training=None):
+    """全seedの方策勾配法をvmapで同時に学習する"""
+    training = training or agent.TrainingConfig(total_steps=total_steps, num_envs=4096)
+    run = jax.jit(jax.vmap(lambda key: agent.train_vec(params, config, training, spec, key)))
+    policies, out = run(jax.random.split(jax.random.PRNGKey(0), SEEDS))
+    count, returns, lengths, failures, values, improved = (np.array(value) for value in out)
+    # 報酬設計を跨いで比べられるよう, 収益からは終端ペナルティを除いておく
+    return np.array(policies), count, returns - params.fail_penalty * failures, lengths, values, improved
 
-def train_trials(params, experiment, training):
-    """全seedをvmapで同時に学習"""
-    keys = jax.random.split(jax.random.PRNGKey(0), experiment.num_seeds)
-    train = lambda key: agent.train_vec(params, experiment.task, experiment.agent_config, training, experiment.num_envs, key)
-    q_tables, finished, returns, lengths = jax.jit(jax.vmap(train))(keys)
-    finished, returns, lengths = np.array(finished), np.array(returns), np.array(lengths)
-    index = np.broadcast_to((np.arange(finished.shape[1]) * experiment.num_envs)[:, None], finished.shape[1:]).ravel()
-    trials = []
-    for seed in range(experiment.num_seeds):
-        mask = finished[seed].ravel()
-        order = np.argsort(index[mask], kind="stable")  # 環境ステップ数の順に並べ替える
-        trials.append(TrialResult(q_tables[seed], index[mask][order], returns[seed].ravel()[mask][order], lengths[seed].ravel()[mask][order]))
-    return tuple(trials)
+def train_analytic(model, bptt=BPTT, config=CONFIG, spec=agent.LINEAR):
+    """全seedのBPTTによる解析的方策勾配をvmapで同時に学習する"""
+    run = jax.jit(jax.vmap(lambda key: agent.train_bptt(model, config, bptt, spec, key)))
+    policies, out = run(jax.random.split(jax.random.PRNGKey(0), SEEDS))
+    return (np.array(policies), *(np.array(value) for value in out))
 
-def trial_curves(trials, field="returns"):
-    """各試行の学習曲線を (環境ステップ数, 移動平均) の組で返す"""
-    averages = [moving_average(getattr(trial, field)) for trial in trials]
-    return [(trial.steps[-len(average):], average) for trial, average in zip(trials, averages)]
+def evaluate_gains(params, gains, key=jax.random.PRNGKey(7)):
+    """決定論的方策 a = k's を実環境で評価し, 維持ステップ数と累積報酬を返す.
 
-def aggregate_curves(curves, points=500):
-    start = max(steps[0] for steps, _ in curves)
-    stop = min(steps[-1] for steps, _ in curves)
+    初期状態は N(0, Sigma) から引くため一部は最初から終端条件を満たす. これらは
+    どの制御則でも維持できないため, 評価から除外する.
+    """
+    x0 = env.sample_states(params, key, EVAL_STATES)
+    valid = np.array(jnp.all(jnp.abs(x0) <= jnp.array(params.state_limit), axis=1))
+    lengths, returns, _ = zip(*[agent.evaluate(params, jnp.asarray(gain), key, EVAL_STATES, EVAL_STEPS)
+                                for gain in gains])
+    return np.array(lengths)[:, valid], np.array(returns)[:, valid]
+
+def report_evaluation(label, params, gains):
+    lengths, returns = evaluate_gains(params, gains)
+    hold = lengths.mean(axis=-1) * params.dt          # 1試行あたりの平均維持時間 [s]
+    success = (lengths >= EVAL_STEPS).mean(axis=-1)   # 全期間維持できた初期状態の割合
+    print(f"[{label}] hold {np.median(hold):.2f} s (quartile {np.percentile(hold, 25):.2f}-{np.percentile(hold, 75):.2f}), "
+          f"success rate {np.median(success):.2f} [{np.percentile(success, 25):.2f}, {np.percentile(success, 75):.2f}], "
+          f"return {np.median(returns.mean(axis=-1)):.2f}")
+    return hold
+
+def curve(count, values, window, x_steps=None):
+    """(エピソード数または環境ステップ数, 1エピソードあたりの平均値) の学習曲線"""
+    episodes = np.cumsum(count)[window - 1:]
+    return (episodes if x_steps is None else x_steps[window - 1:]), moving_ratio(values, count, window)
+
+def aggregate(curves, points=400):
+    """試行をまとめた曲線. 発散した試行があっても残りが描けるようnanを無視する."""
+    start, stop = max(x[0] for x, _ in curves), min(x[-1] for x, _ in curves)
     grid = np.linspace(start, stop, points)
-    stacked = np.stack([np.interp(grid, steps, values) for steps, values in curves])
-    lower, upper = np.percentile(stacked, [25, 75], axis=0)
-    return grid, stacked.mean(axis=0), lower, upper
+    stacked = np.stack([np.interp(grid, x, y) for x, y in curves])
+    stacked = np.where(np.isfinite(stacked), stacked, np.nan)
+    # 中央線は中央値とする. 発散した試行があると平均は外れ値に支配され図の外へ出てしまう
+    return grid, *np.nanpercentile(stacked, [50, 25, 75], axis=0)
 
-def execute(params, experiment, name, planning_steps):
-    """1つの課題設定と1つの手法の組を学習・評価"""
-    x0 = jnp.array(experiment.evaluation_state)
-    cap = experiment.training.max_episode_steps
-    if planning_steps is None:
-        trials = ()
-        rollout = agent.simulate_lqr(params, experiment.task, lqr_gain(params), x0, cap, experiment.task.terminate != "limits")
-    else:
-        trials = train_trials(params, experiment, experiment.training._replace(planning_steps=planning_steps))
-        rollout = agent.rollout_greedy(params, experiment.task, experiment.agent_config, trials[0].q_table, x0, cap)
-    result = ExperimentResult(trials, *(np.array(x) for x in rollout))
-    label = f"{experiment.name}/{name}"
-    if experiment.task.terminate == "limits":
-        failures = np.flatnonzero(result.dones)
-        print(f"[{label}] survived: {failures[0] + 1 if len(failures) else len(result.dones)} steps")
-    else:
-        print(f"[{label}] return: {result.rewards.sum():.1f}")
-    return result
+def band(ax, curves, color, label):
+    grid, middle, low, high = aggregate(curves)
+    ax.fill_between(grid, low, high, color=color, alpha=0.25, lw=0)
+    ax.plot(grid, middle, color=color, lw=2, label=label)
+    return middle
 
-def plot_learning_comparison(experiment, results):
-    plt.figure(figsize=(8, 5))
-    for name, color, label in [("q-learning", "tab:blue", "Q-learning"), ("dyna-q", "tab:orange", "Dyna-Q")]:
-        curves = trial_curves(results[name].trials)
-        grid, mean_curve, lower, upper = aggregate_curves(curves)
-        plt.fill_between(grid, lower, upper, color=color, alpha=0.25, lw=0)
-        plt.plot(grid, mean_curve, color=color, lw=2, label=f"{label} (mean of {len(curves)} seeds, IQR)")
-    # LQRは学習を伴わないため, 収益は比較用の水平線となる
-    lqr_return = results["lqr"].rewards.sum()
-    plt.axhline(lqr_return, color="tab:red", ls="--", lw=1.5, label=f"LQR (return {lqr_return:.0f})")
-    plt.xlabel("environment steps")
-    plt.ylabel("return (moving average)")
-    plt.legend()
-    plt.grid(alpha=0.25)
-    save_figure(experiment.comparison_filename)
-
-def plot_design_ablation(params, experiment, baseline_trials):
-    """報酬設計 (naive) と楽観的初期化の有無を比較する予備実験"""
-    _, axes = plt.subplots(1, 3, figsize=(15, 4.3))
-    cap = experiment.training.max_episode_steps
-    naive_config = experiment.agent_config._replace(n_bins=(8, 1, 64, 32), q_init=0.0)
-    naive = experiment._replace(task=env.SWINGUP_NAIVE_TASK, agent_config=naive_config)
-    naive_trials = train_trials(params, naive, naive.training)
-    grid, mean_curve, low, high = aggregate_curves(trial_curves(naive_trials, "lengths"))
-    axes[0].fill_between(grid, low, high, color="tab:red", alpha=0.25, lw=0)
-    axes[0].plot(grid, mean_curve, color="tab:red", lw=2, label=f"mean of {len(naive_trials)} seeds (IQR)")
-    axes[0].axhline(cap, color="gray", ls=":", lw=1.2, label=f"timeout ({cap} steps)")
-    axes[0].set_ylim(0, cap * 1.08)
-    axes[0].set_title(r"(a) naive reward $r=\cos\theta$: episode length")
-    axes[0].set_ylabel("episode length [steps]")
-    axes[0].annotate(f"{mean_curve[0]:.0f} -> {mean_curve[-1]:.0f} steps", xy=(grid[-1], mean_curve[-1]), xytext=(0.35, 0.45), textcoords="axes fraction", color="tab:red", arrowprops=dict(arrowstyle="->", color="tab:red"))
-    x0 = jnp.array(experiment.evaluation_state)
-    rollout = jax.jit(jax.vmap(lambda q: agent.rollout_greedy(params, naive.task, naive_config, q, x0, cap)))
-    states, _, dones = rollout(jnp.stack([trial.q_table for trial in naive_trials]))
-    states, dones = np.array(states), np.array(dones)
-    for seed in range(len(naive_trials)):
-        end = np.argmax(dones[seed]) + 1 if dones[seed].any() else cap
-        axes[1].plot(np.arange(end) * params.dt, np.abs(states[seed, :end, 0]), color="tab:red", alpha=0.35, lw=1)
-    axes[1].axhline(params.x_limit, color="gray", ls="--", lw=1.2, label=f"rail limit ({params.x_limit} m)")
-    axes[1].set_title("(b) naive reward: greedy policy drives to the rail")
-    axes[1].set_ylabel("cart position |x| [m]")
-    axes[1].set_xlabel("time [s]")
-    zero_init = experiment._replace(agent_config=experiment.agent_config._replace(q_init=0.0))
-    zero_trials = train_trials(params, zero_init, zero_init.training)
-    for trials, color, label in [(zero_trials, "tab:red", r"$Q_0 = 0$"), (baseline_trials, "tab:blue", r"optimistic $Q_0 = 50$")]:
-        grid, mean_curve, low, high = aggregate_curves(trial_curves(trials))
-        axes[2].fill_between(grid, low, high, color=color, alpha=0.25, lw=0)
-        axes[2].plot(grid, mean_curve, color=color, lw=2, label=f"{label}: {mean_curve[-1]:.0f}")
-    axes[2].set_ylim(0, cap * 1.08)
-    axes[2].set_title(r"(c) fixed reward $r=(1+\cos\theta)/2$: return")
-    axes[2].set_ylabel("return (moving average)")
-    for ax in (axes[0], axes[2]):
-        ax.set_xlabel("environment steps")
+def plot_reward_design(spec, shaped):
+    """課題指定の報酬と終端ペナルティを加えた報酬の学習曲線"""
+    _, axes = plt.subplots(1, 2, figsize=(11, 4.3))
+    window = spec[1].shape[1] // 2000
+    for (policies, count, returns, lengths, _, _), color, name in (
+            (spec, "tab:red", r"as specified ($r=-s'Qs-aRa$)"),
+            (shaped, "tab:blue", r"with terminal penalty ($-20$ on failure)")):
+        band(axes[0], [curve(count[s], returns[s], window) for s in range(SEEDS)], color, name)
+        band(axes[1], [curve(count[s], lengths[s], window) for s in range(SEEDS)], color, name)
+    axes[0].set_ylabel(r"return per episode under $r=-s'Qs-aRa$")
+    axes[0].set_title("(a) cumulative reward (terminal penalty excluded)")
+    axes[1].axhline(200, color="gray", ls=":", lw=1.2, label="episode cap (200 steps)")
+    axes[1].set_ylabel("episode length [steps]")
+    axes[1].set_title("(b) balancing time")
     for ax in axes:
-        ax.legend(loc="best", fontsize=9)
+        ax.set_xlabel("episodes")
+        ax.set_xscale("log")
         ax.grid(alpha=0.25)
-    save_figure("swingup_ablation.png")
-    return naive_trials, zero_trials
+        ax.legend(fontsize=9)
+    save_figure("reward_design.png")
 
-def plot_trajectories(params, experiment, results):
-    plt.figure(figsize=(8, 4.5))
-    drawn = []
-    for name in ALGORITHMS:
-        result = results[name]
-        theta = np.unwrap(result.states[:, 2]) if experiment.task.wrap_angle else result.states[:, 2]
-        failures = np.flatnonzero(result.dones)
-        end = failures[0] + 1 if len(failures) else len(theta)
+def plot_method_comparison(shaped, analytic, lqr_value):
+    """方策勾配法とBPTTを, 消費したエピソード数に対して比較する"""
+    policies, count, _, lengths, values, _ = shaped
+    _, value_curve, length_curve, _ = analytic  # 最大化している目的関数 (割引収益) で揃える
+    _, axes = plt.subplots(1, 2, figsize=(11, 4.3))
+    window = count.shape[1] // 2000
+    bptt_x = np.arange(1, value_curve.shape[1] + 1) * BPTT.batch
+    for ax, pg_values, bptt_values, ylabel, title in (
+            (axes[0], values, value_curve, "discounted return per episode", "(a) discounted return (the objective)"),
+            (axes[1], lengths, length_curve, "episode length [steps]", "(b) balancing time")):
+        band(ax, [curve(count[s], pg_values[s], window) for s in range(SEEDS)], "tab:blue",
+             "policy gradient (real episodes)")
+        band(ax, [(bptt_x, bptt_values[s]) for s in range(SEEDS)], "tab:green",
+             "analytic gradient / BPTT (imagined episodes)")
+        ax.set_xlabel("episodes consumed")
+        ax.set_xscale("log")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(alpha=0.25)
+    axes[0].axhline(lqr_value, color="tab:red", ls="--", lw=1.5, label=f"LQR ({lqr_value:.2f})")
+    axes[1].axhline(200, color="gray", ls=":", lw=1.2, label="episode cap (200 steps)")
+    for ax in axes:
+        ax.legend(fontsize=9, loc="best")
+    save_figure("method_comparison.png")
+
+def gradient_samples(params, policy, key, episodes, spec=agent.LINEAR):
+    """同じ初期状態・同じ乱数列の上で, 2種類の勾配推定量を1エピソードずつ評価する"""
+    key_state, key_noise = jax.random.split(key)
+    x0 = env.sample_states(params, key_state, episodes)
+    noise = jax.random.normal(key_noise, (episodes, BPTT.horizon))
+    # params, CONFIG, spec は閉じ込めて静的に扱う (PolicySpecはPython分岐に使うため)
+    over_episodes = lambda fn: jax.jit(jax.vmap(
+        lambda p, state, eps: fn(params, CONFIG, spec, p, state, eps), in_axes=(None, 0, 0)))
+    (_, (length, _)), pathwise = over_episodes(agent.analytic_gradient)(policy, x0, noise)
+    likelihood = over_episodes(agent.likelihood_ratio_gradient)(policy, x0, noise)
+    return np.array(pathwise), np.array(likelihood), np.array(length)
+
+def plot_gradient_quality(params, policies, key=jax.random.PRNGKey(11), episodes=32768, batches=16):
+    """勾配推定量の質を, 学習初期の方策と学習後の方策の2点で比較する"""
+    _, axes = plt.subplots(1, len(policies), figsize=(5.5 * len(policies), 4.3), squeeze=False)
+    sizes = np.unique(np.geomspace(1, episodes // batches, 20).astype(int))
+    for ax, (title, policy) in zip(axes[0], policies):
+        pathwise, likelihood, length = gradient_samples(params, policy, key, episodes)
+        # 基準方向: 標準誤差が十分小さい解析的勾配の平均を真の勾配とみなす
+        reference = pathwise.mean(axis=0) / np.linalg.norm(pathwise.mean(axis=0))
+        for samples, color, name in ((pathwise, "tab:green", "analytic gradient (BPTT)"),
+                                     (likelihood, "tab:blue", "likelihood ratio (policy gradient)")):
+            aligned = []
+            for size in sizes:  # size本のエピソードから作った推定値と真の勾配方向との一致度
+                pooled = samples[: (episodes // size) * size].reshape(-1, size, 5).mean(axis=1)
+                aligned.append(np.mean(pooled @ reference / np.maximum(np.linalg.norm(pooled, axis=1), 1e-12)))
+            ax.plot(sizes, aligned, "o-", color=color, ms=4, label=name)
+            error = np.linalg.norm(samples.std(axis=0) / np.sqrt(episodes)) / np.linalg.norm(samples.mean(axis=0))
+            print(f"[gradient/{title}] {name}: relative std "
+                  f"{np.linalg.norm(samples.std(axis=0)) / np.linalg.norm(samples.mean(axis=0)):8.1f}, "
+                  f"standard error of the mean over {episodes} episodes {error:7.3f} x |mean|, "
+                  f"cosine at 1 episode {aligned[0]:6.3f}, at {sizes[-1]} episodes {aligned[-1]:6.3f}")
+        print(f"[gradient/{title}] mean episode length {length.mean():.1f} steps")
+        ax.axhline(0.0, color="gray", lw=0.8)
+        ax.set_xscale("log")
+        ax.set_xlabel("episodes per gradient estimate")
+        ax.set_ylabel("cosine similarity with the true gradient")
+        ax.set_title(f"{title} (mean episode length {length.mean():.0f} steps)")
+        ax.set_ylim(-0.3, 1.05)
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=9, loc="lower right")
+    save_figure("gradient_quality.png")
+
+def plot_trajectories(params, gains, filename="trajectories.png"):
+    """学習後の各手法の軌道"""
+    x0 = jnp.array([0.0, 0.0, 8.0 * jnp.pi / 180.0, 0.0])
+    _, axes = plt.subplots(3, 1, figsize=(7.5, 7), sharex=True)
+    for (name, gain, color) in gains:
+        states, _, dones = (np.array(v) for v in agent.rollout_linear(params, jnp.asarray(gain), x0, EVAL_STEPS))
+        end = np.argmax(dones) + 1 if dones.any() else len(dones)
         t = np.arange(end) * params.dt
-        degrees = np.rad2deg(theta[:end])
-        drawn.append(degrees)
-        terminated = end < len(theta)
-        line, = plt.plot(t, degrees, label=name + (f" (terminated at {t[-1]:.2f} s)" if terminated else ""))
-        if terminated:
-            plt.plot(t[-1], degrees[-1], "x", color=line.get_color(), ms=9, mew=2)
-    low = min(d.min() for d in drawn)
-    high = max(d.max() for d in drawn)
-    margin = 0.08 * max(high - low, 1.0)
-    for level in range(-720, 721, 180):  # 180度ごとの補助線 (0度が直立)
-        if low - margin <= level <= high + margin:
-            plt.axhline(level, color="gray", **(dict(lw=0.8, ls="--") if level % 360 == 0 else dict(lw=0.5)))
-    plt.ylim(low - margin, high + margin)
-    plt.xlabel("time [s]")
-    plt.ylabel("pole angle [deg]  (0 = upright)")
-    plt.legend()
-    save_figure(experiment.trajectory_filename)
+        axes[0].plot(t, np.rad2deg(states[:end, 2]), color=color, label=name)
+        axes[1].plot(t, states[:end, 0], color=color)
+        axes[2].plot(t, np.clip(states[:end] @ np.asarray(gain), -params.force_limit, params.force_limit), color=color)
+        if end < len(dones):
+            axes[0].plot(t[-1], np.rad2deg(states[end - 1, 2]), "x", color=color, ms=9, mew=2)
+    axes[0].axhline(12.0, color="gray", ls="--", lw=1)
+    axes[0].axhline(-12.0, color="gray", ls="--", lw=1)
+    axes[0].set_ylabel("pole angle [deg]")
+    axes[1].set_ylabel("cart position [m]")
+    axes[2].set_ylabel("force [N]")
+    axes[2].set_xlabel("time [s]")
+    axes[0].legend(fontsize=9)
+    for ax in axes:
+        ax.grid(alpha=0.25)
+    save_figure(filename)
+
+def best_policy(policies, hold):
+    """代表として, 評価で最も長く維持できたseedの方策を返す"""
+    return jnp.asarray(policies[int(np.argmax(hold))])
+
+def report_swingup(label, params, policies, spec=SWINGUP_SPEC):
+    """swing-up方策を評価し, 収益・倒立到達時刻・終盤の倒立滞在率を出力する"""
+    returns, residency, rotations = [], [], []
+    for policy in policies:
+        states, episode_return, alive = agent.evaluate_policy(
+            params, spec, jnp.asarray(policy), jax.random.PRNGKey(5), 64, SWINGUP_STEPS)
+        states, alive = np.array(states), np.array(alive)
+        upright = (np.abs(states[:, :, 2]) < params.state_limit[2]) & alive
+        returns.append(float(np.mean(episode_return)))
+        residency.append(float(np.mean(upright[:, -100:])))          # 終盤100ステップの倒立滞在率
+        # 後半で何周したか. 静止なら0, 大振幅の往復なら1前後, 回転していれば数周以上になる
+        unwrapped = np.unwrap(states[:, :, 2], axis=1)
+        rotations.append(float(np.median(np.abs(unwrapped[:, -1] - unwrapped[:, 150]) / (2.0 * np.pi))))
+    returns, residency, rotations = np.array(returns), np.array(residency), np.array(rotations)
+    finite = np.isfinite(returns)
+    mean_return = float(np.mean(returns[finite])) if finite.any() else np.nan
+    std_return = float(np.std(returns[finite])) if finite.any() else np.nan
+    print(f"[{label}] return {mean_return:.1f} +/- {std_return:.1f} (mean +/- std over finite seeds), "
+          f"upright residency {np.mean(residency):.2f} +/- {np.std(residency):.2f}, "
+          f"rotations {np.median(rotations):.2f}, finite seeds {finite.sum()}/{len(returns)}, "
+          f"success (residency > 0.9) {np.mean(residency > 0.9):.0%}")
+    return residency, mean_return
+
+def plot_swingup(pg, analytic, policies, lqr_return):
+    """swing-up課題の学習曲線と, 学習後の方策の軌道"""
+    _, axes = plt.subplots(1, 2, figsize=(11.5, 4.3))
+    count, returns = pg[1], pg[2]
+    window = max(count.shape[1] // 200, 1)
+    band(axes[0], [curve(count[s], returns[s], window) for s in range(SEEDS)], "tab:blue",
+         "policy gradient (real episodes)")
+    bptt_x = np.arange(1, analytic[3].shape[1] + 1) * SWINGUP_BPTT.batch
+    band(axes[0], [(bptt_x, analytic[3][s]) for s in range(SEEDS)], "tab:green",
+         "analytic gradient / BPTT (imagined episodes)")
+    axes[0].axhline(SWINGUP_STEPS, color="gray", ls=":", lw=1.2, label=f"upper bound ({SWINGUP_STEPS})")
+    axes[0].axhline(lqr_return, color="tab:red", ls="--", lw=1.5, label=f"LQR ({lqr_return:.0f})")
+    axes[0].set_xscale("log")
+    # 方策勾配法とLQRは大きな負の値へ発散するため, 0近傍を線形とする対数軸で描く
+    axes[0].set_yscale("symlog", linthresh=100)
+    axes[0].set_ylim(min(1.5 * lqr_return, -1000.0), SWINGUP_STEPS * 2)
+    axes[0].set_xlabel("episodes consumed")
+    axes[0].set_ylabel("return per episode")
+    axes[0].set_title("(a) learning curve")
+    for name, policy, spec, color in policies:  # 角度は折り返さずに描く
+        states, _, _ = agent.rollout_policy(SWINGUP_PARAMS, spec, jnp.asarray(policy),
+                                            jnp.array(SWINGUP_PARAMS.initial_mean), SWINGUP_STEPS)
+        angle = np.rad2deg(np.unwrap(np.array(states)[:, 2]))
+        axes[1].plot(np.arange(SWINGUP_STEPS) * SWINGUP_PARAMS.dt, angle, color=color, label=name)
+    for level in range(-720, 721, 180):
+        axes[1].axhline(level, color="gray", lw=0.8 if level % 360 == 0 else 0.4,
+                        ls="--" if level % 360 == 0 else "-")
+    axes[1].set_xlabel("time [s]")
+    axes[1].set_ylabel("pole angle [deg]  (0 = upright, 180 = hanging)")
+    axes[1].set_title("(b) trajectory from the hanging state")
+    for ax in axes:
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=9)
+    save_figure("swingup.png")
 
 if __name__ == "__main__":
-    params = env.CartPoleParams()
-    results = {}
-    for experiment in EXPERIMENTS:
-        results[experiment.name] = {name: execute(params, experiment, name, planning) for name, planning in ALGORITHMS.items()}
-        plot_learning_comparison(experiment, results[experiment.name])
-        if experiment.trajectory_filename:
-            plot_trajectories(params, experiment, results[experiment.name])
-    agent.region_of_attraction(params, EXPERIMENTS[0].task, lqr_gain(params))
-    # swing-up課題の報酬設計・探索設計に関する予備実験
-    swingup = EXPERIMENTS[1]
-    naive_trials, zero_trials = plot_design_ablation(params, swingup, results["swingup"]["q-learning"].trials)
-    naive_len = [values[-1] for _, values in trial_curves(naive_trials, "lengths")]
-    naive_ret = [values[-1] for _, values in trial_curves(naive_trials)]
-    zero_ret = [values[-1] for _, values in trial_curves(zero_trials)]
-    print(f"[swingup/naive-reward] episode length (MA): {np.mean(naive_len):.1f} +/- {np.std(naive_len):.1f} steps, return {np.mean(naive_ret):.1f}")
-    print(f"[swingup/zero-init]     final return (MA): {np.mean(zero_ret):.1f} +/- {np.std(zero_ret):.1f}")
+    lqr = agent.lqr_gain(SHAPED_PARAMS, CONFIG)
+    print("LQR gain a = k's        :", np.array2string(np.array(lqr), precision=3))
+    print("equivalent policy theta :", np.array2string(np.array(lqr / agent.NORMALIZER), precision=3))
+
+    # --- 報酬設計: 課題指定の報酬では自滅方策が最適になる ---
+    for label, params in (("as specified", SPEC_PARAMS), ("terminal penalty", SHAPED_PARAMS)):
+        best = agent.search_linear_gain(params, CONFIG, jax.random.PRNGKey(0))
+        print(f"[CEM/{label}] best linear gain {np.array2string(np.array(best), precision=2)}")
+        report_evaluation(f"CEM/{label}", params, [best])
+        report_evaluation(f"zero-gain/{label}", params, [jnp.zeros(4)])
+        report_evaluation(f"LQR/{label}", params, [lqr])
+
+    spec = train_policy_gradient(SPEC_PARAMS)
+    shaped = train_policy_gradient(SHAPED_PARAMS)
+    for label, (policies, count, _, _, _, improved), params in (
+            ("PG/as specified", spec, SPEC_PARAMS), ("PG/terminal penalty", shaped, SHAPED_PARAMS)):
+        print(f"[{label}] {count.sum(-1).mean():.0f} episodes, {improved.sum(-1).mean():.0f} policy updates")
+        hold = report_evaluation(label, params, [agent.feedback_gain(jnp.asarray(p)) for p in policies])
+    report_evaluation("LQR", SHAPED_PARAMS, [lqr])
+    plot_reward_design(spec, shaped)
+
+    # --- BPTTによる解析的方策勾配 ---
+    analytic = train_analytic(SHAPED_PARAMS)
+    analytic_gains = [agent.feedback_gain(jnp.asarray(p)) for p in analytic[0]]
+    analytic_hold = report_evaluation("BPTT", SHAPED_PARAMS, analytic_gains)
+    # 学習曲線と同じ条件 (200ステップ, 終端ペナルティなし) でLQRの収益を測る
+    lqr_return = float(np.mean(agent.evaluate(SHAPED_PARAMS, lqr, jax.random.PRNGKey(7),
+                                              EVAL_STATES, BPTT.horizon, CONFIG.gamma)[2]))
+    print(f"[LQR] discounted return over {BPTT.horizon} steps: {lqr_return:.3f}")
+    plot_method_comparison(shaped, analytic, lqr_return)
+
+    pg_policies, pg_hold = shaped[0], report_evaluation("PG (final)", SHAPED_PARAMS,
+                                                        [agent.feedback_gain(jnp.asarray(p)) for p in shaped[0]])
+    print("PG gain    :", np.array2string(np.array(agent.feedback_gain(best_policy(pg_policies, pg_hold))), precision=3))
+    print("BPTT gain  :", np.array2string(np.array(agent.feedback_gain(best_policy(analytic[0], analytic_hold))), precision=3))
+    plot_gradient_quality(SHAPED_PARAMS, [
+        ("initial policy", agent.init_policy(agent.LINEAR, jax.random.PRNGKey(0))),
+        ("learned policy", best_policy(analytic[0], analytic_hold))])
+    plot_trajectories(SHAPED_PARAMS, [
+        ("policy gradient", agent.feedback_gain(best_policy(pg_policies, pg_hold)), "tab:blue"),
+        ("analytic gradient (BPTT)", agent.feedback_gain(best_policy(analytic[0], analytic_hold)), "tab:green"),
+        ("LQR", lqr, "tab:red")])
+
+    # --- モデル誤差: モデルを使う2手法だけが影響を受ける ---
+    wrong_analytic = train_analytic(WRONG_MODEL)
+    report_evaluation("BPTT (wrong model)", SHAPED_PARAMS,
+                      [agent.feedback_gain(jnp.asarray(p)) for p in wrong_analytic[0]])
+    report_evaluation("LQR (wrong model)", SHAPED_PARAMS, [agent.lqr_gain(WRONG_MODEL, CONFIG)])
+
+    # --- 5章: swing-up課題 ---
+    swing_pg = train_policy_gradient(SWINGUP_PARAMS, SWINGUP_TRAINING.total_steps,
+                                     SWINGUP_CONFIG, SWINGUP_SPEC, SWINGUP_TRAINING)
+    print(f"[swingup/PG] {swing_pg[1].sum(-1).mean():.0f} episodes, {swing_pg[5].sum(-1).mean():.0f} policy updates")
+    pg_residency, _ = report_swingup("swingup/PG", SWINGUP_PARAMS, swing_pg[0])
+    swing_bptt = train_analytic(SWINGUP_PARAMS, SWINGUP_BPTT, SWINGUP_CONFIG, SWINGUP_SPEC)
+    bptt_residency, _ = report_swingup("swingup/BPTT", SWINGUP_PARAMS, swing_bptt[0])
+    # 直立点まわりで線形化したLQRは真下からでは機能しない
+    lqr_policy = jnp.concatenate([lqr / agent.NORMALIZER, jnp.zeros(1)])
+    _, lqr_swing_return = report_swingup("swingup/LQR", SWINGUP_PARAMS, [lqr_policy], agent.LINEAR)
+    # 課題指定の特徴 phi = C s のままでは振り上げを表現できないことの確認
+    plain_bptt = train_analytic(SWINGUP_PARAMS, SWINGUP_BPTT, SWINGUP_CONFIG, agent.LINEAR)
+    report_swingup("swingup/BPTT (phi = Cs as specified)", SWINGUP_PARAMS, plain_bptt[0], agent.LINEAR)
+    plot_swingup(swing_pg, swing_bptt, [
+        ("policy gradient", best_policy(swing_pg[0], pg_residency), SWINGUP_SPEC, "tab:blue"),
+        ("analytic gradient (BPTT)", best_policy(swing_bptt[0], bptt_residency), SWINGUP_SPEC, "tab:green"),
+        ("LQR", lqr_policy, agent.LINEAR, "tab:red")], lqr_swing_return)
