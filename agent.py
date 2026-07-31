@@ -13,7 +13,7 @@ class AgentConfig(NamedTuple):
     alpha: float = 0.1         # 学習率
     angle_tol: float = 3e-3    # 方策改善を行うか判定する勾配推定値の角度基準 [rad]
     sigma_offset: float = 0.1  # sigma = 0.1 + 1/(1 + exp(eta))
-    clip: float = 0.0          # 方策勾配のノルムの上限 (0なら制限しない)
+    clip: float = 3.0          # 方策勾配のノルムの上限
 
 class TrainingConfig(NamedTuple):
     total_steps: int              # 実環境で消費するステップ数
@@ -40,13 +40,15 @@ class PolicySpec(NamedTuple):
     rbf_rate: int = 0    # 角速度方向のRBF中心の数
     rate_limit: float = 8.0  # 角速度方向にRBFを張る範囲 [rad/s]
     init_scale: float = 5.0  # theta ~ U[-init_scale, init_scale] (課題指定は5)
+    normalize: bool = True   # Falseなら phi(s) = s. 状態フィードバック a = k's をこの形で扱う
 
 LINEAR = PolicySpec()
+GAIN = PolicySpec(normalize=False)  # theta をそのままゲイン k とみなす方策 (LQRなどの比較用)
 
 def feature_vector(spec: PolicySpec, state: jnp.ndarray) -> jnp.ndarray:
     """方策への入力 phi(s). 課題指定の設定では C s そのものである."""
     if spec.rbf_angle == 0:
-        return NORMALIZER * state
+        return NORMALIZER * state if spec.normalize else state
     y, y_dot = state[2], state[3]
     # 角度は周期的なので cos(y - c) に基づくRBFを用いる. 幅は中心の間隔に合わせる.
     centers = jnp.linspace(-jnp.pi, jnp.pi, spec.rbf_angle, endpoint=False)
@@ -88,16 +90,9 @@ def feedback_gain(policy: jnp.ndarray) -> jnp.ndarray:
 def action_std(config: AgentConfig, policy: jnp.ndarray):
     return config.sigma_offset + jax.nn.sigmoid(-policy[-1])  # 1/(1+exp(eta))
 
-def log_prob(config: AgentConfig, spec: PolicySpec, policy: jnp.ndarray, state: jnp.ndarray, action):
-    """ガウス方策の対数尤度 ln pi(a|s; theta, eta)"""
-    std = action_std(config, policy)
-    return -0.5 * jnp.log(2.0 * jnp.pi * std**2) - 0.5 * ((action - mean_action(spec, policy, state)) / std) ** 2
-
-score = jax.grad(log_prob, argnums=2)  # [grad_theta ln pi, grad_eta ln pi]
-
 def scores(config: AgentConfig, spec: PolicySpec, policy: jnp.ndarray,
            states: jnp.ndarray, actions: jnp.ndarray):
-    """全レーンのscore (解析形. jax.gradと一致することを確認している)."""
+    """全レーンのscore grad ln pi(a|s; theta, eta) (解析形. jax.gradと一致することを確認している)."""
     std = action_std(config, policy)
     phi = jax.vmap(feature_vector, in_axes=(None, 0))(spec, states)
     residual = (actions - phi @ policy[:phi.shape[1]]) / std**2
@@ -152,8 +147,7 @@ def train_vec(params: env.CartPoleParams, config: AgentConfig, training: Trainin
         improve = (count > 0) & (n >= 2.0) & (angle < config.angle_tol)
         # 勾配ノルムの上限. deltaの分布は裾が重く, 稀に外れ値がDeltaを支配して通常の
         # 数百倍の更新が入り学習が発散するため, 更新の大きさを制限する.
-        scale = 1.0 if config.clip <= 0.0 else jnp.minimum(
-            1.0, config.clip / jnp.maximum(jnp.linalg.norm(delta_new), 1e-12))
+        scale = jnp.minimum(1.0, config.clip / jnp.maximum(jnp.linalg.norm(delta_new), 1e-12))
         policy = policy + jnp.where(improve, config.alpha * scale, 0.0) * delta_new
         n = jnp.where(improve, 1.0, jnp.where(count > 0, n + 1.0, n))
 
@@ -241,22 +235,23 @@ def train_bptt(model: env.CartPoleParams, config: AgentConfig, bptt: BpttConfig,
     (policy, _), out = jax.lax.scan(scan_step, (init_policy(spec, key_policy), key), None, length=bptt.updates)
     return policy, out  # 方策と (割引収益, エピソード長, 終端ペナルティを除いた収益) の推移
 
-@partial(jax.jit, static_argnums=(0, 3))
-def rollout_linear(params: env.CartPoleParams, gain: jnp.ndarray, x0: jnp.ndarray, steps: int = 3000):
-    """状態フィードバック a = k's による軌道. 学習した方策の平均もLQRもこの形をとる."""
+@partial(jax.jit, static_argnums=(0, 1, 4))
+def rollout(params: env.CartPoleParams, spec: PolicySpec, policy: jnp.ndarray,
+            x0: jnp.ndarray, steps: int):
+    """方策の平均 mu(s) を用いた決定論的な軌道. spec = GAIN なら状態フィードバック a = k's になる."""
     def body(state, _):
-        next_state, reward, done = env.step(params, state, jnp.dot(gain, state))
+        next_state, reward, done = env.step(params, state, mean_action(spec, policy, state))
         return next_state, (state, reward, done)
     return jax.lax.scan(body, x0, None, length=steps)[1]
 
-@partial(jax.jit, static_argnums=(0, 3, 4))
-def evaluate(params: env.CartPoleParams, gain: jnp.ndarray, key: jax.Array,
-             num_states: int = 256, steps: int = 1000, gamma: float = 1.0):
-    """初期状態分布から決定論的方策を評価し, 維持ステップ数・累積報酬・割引収益を返す"""
+@partial(jax.jit, static_argnums=(0, 1, 4, 5))
+def evaluate(params: env.CartPoleParams, spec: PolicySpec, policy: jnp.ndarray, key: jax.Array,
+             num_states: int, steps: int, gamma: float = 1.0):
+    """初期状態分布から決定論的方策を評価し, 状態列・生存フラグ・累積報酬・割引収益を返す"""
     x0 = env.sample_states(params, key, num_states)
-    _, rewards, dones = jax.vmap(lambda state: rollout_linear(params, gain, state, steps))(x0)
+    states, rewards, dones = jax.vmap(lambda state: rollout(params, spec, policy, state, steps))(x0)
     alive = jnp.cumsum(dones, axis=1) - dones == 0  # 終端した時点までを評価対象とする
-    return (jnp.sum(alive, axis=1), jnp.sum(jnp.where(alive, rewards, 0.0), axis=1),
+    return (states, alive, jnp.sum(jnp.where(alive, rewards, 0.0), axis=1),
             jnp.sum(jnp.where(alive, rewards * gamma ** jnp.arange(steps), 0.0), axis=1))
 
 def search_linear_gain(params: env.CartPoleParams, config: AgentConfig, key: jax.Array,
@@ -270,7 +265,7 @@ def search_linear_gain(params: env.CartPoleParams, config: AgentConfig, key: jax
     discount = config.gamma ** jnp.arange(steps)
 
     def value(gain, state):
-        _, rewards, dones = rollout_linear(params, gain, state, steps)
+        _, rewards, dones = rollout(params, GAIN, gain, state, steps)
         alive = jnp.cumsum(dones) - dones == 0
         return jnp.sum(jnp.where(alive, rewards * discount, 0.0))
 
@@ -282,24 +277,6 @@ def search_linear_gain(params: env.CartPoleParams, config: AgentConfig, key: jax
         best = pool[jnp.argsort(score(pool))[-elite:]]
         mean, std = best.mean(axis=0), best.std(axis=0) + 1e-3
     return mean
-
-@partial(jax.jit, static_argnums=(0, 1, 4))
-def rollout_policy(params: env.CartPoleParams, spec: PolicySpec, policy: jnp.ndarray,
-                   x0: jnp.ndarray, steps: int = 500):
-    """方策の平均 mu(s) を用いた決定論的な軌道"""
-    def body(state, _):
-        next_state, reward, done = env.step(params, state, mean_action(spec, policy, state))
-        return next_state, (state, reward, done)
-    return jax.lax.scan(body, x0, None, length=steps)[1]
-
-@partial(jax.jit, static_argnums=(0, 1, 4, 5))
-def evaluate_policy(params: env.CartPoleParams, spec: PolicySpec, policy: jnp.ndarray,
-                    key: jax.Array, num_states: int = 256, steps: int = 500):
-    """初期状態分布から決定論的方策を評価し, 各試行の状態列と累積報酬を返す"""
-    x0 = env.sample_states(params, key, num_states)
-    states, rewards, dones = jax.vmap(lambda state: rollout_policy(params, spec, policy, state, steps))(x0)
-    alive = jnp.cumsum(dones, axis=1) - dones == 0
-    return states, jnp.sum(jnp.where(alive, rewards, 0.0), axis=1), alive
 
 def linearize(params: env.CartPoleParams):
     """直立平衡点まわりで線形化し, 時定数tauで離散化した状態方程式を返す (摩擦は無視する)"""
